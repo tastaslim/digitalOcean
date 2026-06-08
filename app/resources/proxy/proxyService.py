@@ -24,13 +24,12 @@ shadowPool = ShadowPool(maxConcurrent=settings.MAX_CONCURRENT_SHADOWS)
 
 def _authHeaders(apiKey: str) -> dict[str, str]:
     """
-    Build Authorization and Content-Type headers for an LLM request.
+    Build ``Authorization`` and ``Content-Type`` headers for an LLM request.
 
-    Args:
-        apiKey: Bearer token for the target endpoint.
-
-    Returns:
-        Dict containing Authorization and Content-Type headers.
+    :param apiKey: Bearer token for the target endpoint.
+    :type apiKey: str
+    :return: Dict containing ``Authorization`` and ``Content-Type`` headers.
+    :rtype: dict[str, str]
     """
     return {"Authorization": f"Bearer {apiKey}", "Content-Type": "application/json"}
 
@@ -44,18 +43,18 @@ async def _callLlm(
     """
     POST a chat completion payload to an LLM endpoint and return the parsed response.
 
-    Args:
-        client: Shared async HTTP client for the request.
-        url: Full chat completions URL of the target endpoint.
-        apiKey: Bearer token for authentication.
-        payload: OpenAI-compatible request body.
-
-    Returns:
-        Parsed JSON response from the LLM.
-
-    Raises:
-        httpx.HTTPStatusError: If the endpoint returns a non-2xx status.
-        httpx.RequestError: If the request fails at the transport layer.
+    :param client: Shared async HTTP client for the request.
+    :type client: httpx.AsyncClient
+    :param url: Full chat completions URL of the target endpoint.
+    :type url: str
+    :param apiKey: Bearer token for authentication.
+    :type apiKey: str
+    :param payload: OpenAI-compatible request body.
+    :type payload: dict[str, Any]
+    :return: Parsed JSON response from the LLM.
+    :rtype: dict[str, Any]
+    :raises httpx.HTTPStatusError: If the endpoint returns a non-2xx status.
+    :raises httpx.RequestError: If the request fails at the transport layer.
     """
     response = await client.post(url, headers=_authHeaders(apiKey), json=payload, timeout=60.0)
     response.raise_for_status()
@@ -66,11 +65,10 @@ def _getContent(llmResponse: dict[str, Any]) -> str:
     """
     Extract the raw content string from the first choice of an LLM response.
 
-    Args:
-        llmResponse: Raw LLM response dict (OpenAI-compatible schema).
-
-    Returns:
-        Content string, or empty string if the path is missing.
+    :param llmResponse: Raw LLM response dict (OpenAI-compatible schema).
+    :type llmResponse: dict[str, Any]
+    :return: Content string, or an empty string if the path is missing.
+    :rtype: str
     """
     try:
         return llmResponse["choices"][0]["message"]["content"]
@@ -80,13 +78,13 @@ def _getContent(llmResponse: dict[str, Any]) -> str:
 
 def _extractAction(llmResponse: dict[str, Any]) -> str | None:
     """
-    Parse the first choice's content as JSON and extract the `action` key.
+    Parse the first choice's content as JSON and extract the ``action`` key.
 
-    Args:
-        llmResponse: Raw LLM response dict (OpenAI-compatible schema).
-
-    Returns:
-        The value of the `action` key if present and parseable, otherwise None.
+    :param llmResponse: Raw LLM response dict (OpenAI-compatible schema).
+    :type llmResponse: dict[str, Any]
+    :return: Value of the ``action`` key if the content is valid JSON and the
+        key is present; ``None`` otherwise.
+    :rtype: str or None
     """
     try:
         content: str = llmResponse["choices"][0]["message"]["content"]
@@ -97,12 +95,14 @@ def _extractAction(llmResponse: dict[str, Any]) -> str | None:
 
 async def _runShadow(candidatePayload: dict[str, Any], primaryResponse: dict[str, Any]) -> None:
     """
-    Fire-and-forget coroutine: call the candidate LLM, evaluate against the primary
-    response, stream any mismatch to SQLite, and update metricsStore. Never raises.
+    Fire-and-forget coroutine: call the candidate LLM, evaluate against the
+    primary response, stream any mismatch to SQLite, and update
+    :data:`metricsStore`.  Never raises — all exceptions are caught and logged.
 
-    Args:
-        candidatePayload: Request body to send to the candidate endpoint.
-        primaryResponse: Already-returned primary LLM response used for comparison.
+    :param candidatePayload: Request body to send to the candidate endpoint.
+    :type candidatePayload: dict[str, Any]
+    :param primaryResponse: Already-returned primary LLM response used for comparison.
+    :type primaryResponse: dict[str, Any]
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -143,14 +143,16 @@ async def _runShadow(candidatePayload: dict[str, Any], primaryResponse: dict[str
 async def proxyChat(requestPayload: dict[str, Any]) -> dict[str, Any]:
     """
     Route the request to the primary LLM and immediately return its response.
-    Conditionally dispatches the same request to the candidate for shadow evaluation
-    based on runtimeConfig.shadowPercentage, subject to pool capacity.
 
-    Args:
-        requestPayload: OpenAI-compatible chat request body (model key excluded).
+    Conditionally dispatches the same request to the candidate for shadow
+    evaluation based on :attr:`runtimeConfig.shadowPercentage`, subject to
+    :data:`shadowPool` capacity.
 
-    Returns:
-        The primary LLM's raw response dict.
+    :param requestPayload: OpenAI-compatible chat request body (``model`` key
+        excluded — injected per-call by this function).
+    :type requestPayload: dict[str, Any]
+    :return: The primary LLM's raw response dict.
+    :rtype: dict[str, Any]
     """
     await metricsStore.incrementRequests()
 

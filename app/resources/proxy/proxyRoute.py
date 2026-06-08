@@ -10,13 +10,14 @@ proxyRoute = APIRouter(prefix="/v1", tags=["proxy"])
 async def chat(request: ChatRequest) -> Any:
     """
     Proxy a chat completion request to the primary LLM and return its response.
-    The same request is concurrently dispatched to the candidate LLM in the background.
 
-    Args:
-        request: Validated OpenAI-compatible chat request body.
+    The same request is concurrently dispatched to the candidate LLM in the
+    background via the shadow pool; candidate latency never affects this response.
 
-    Returns:
-        The primary LLM's raw chat completion response.
+    :param request: Validated OpenAI-compatible chat request body.
+    :type request: ChatRequest
+    :return: The primary LLM's raw chat completion response.
+    :rtype: dict[str, Any]
     """
     # model is excluded here; the service injects PRIMARY/CANDIDATE model names per call.
     payload = request.model_dump(exclude_none=True, exclude={"model"})

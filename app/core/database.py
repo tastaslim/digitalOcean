@@ -20,7 +20,11 @@ def _dbPath() -> str:
 
 
 async def initDb() -> None:
-    """Create the mismatches table if it does not already exist."""
+    """
+    Create the ``mismatches`` table if it does not already exist.
+
+    Safe to call on every application startup; uses ``CREATE TABLE IF NOT EXISTS``.
+    """
     async with aiosqlite.connect(_dbPath()) as db:
         await db.execute(_CREATE_TABLE)
         await db.commit()
@@ -35,11 +39,14 @@ async def recordMismatch(
     """
     Persist an action-key mismatch row to SQLite for offline debugging.
 
-    Args:
-        primaryAction: The `action` value extracted from the primary response.
-        candidateAction: The `action` value extracted from the candidate response.
-        primaryContent: Raw content string from the primary LLM message.
-        candidateContent: Raw content string from the candidate LLM message.
+    :param primaryAction: The ``action`` value extracted from the primary response.
+    :type primaryAction: str or None
+    :param candidateAction: The ``action`` value extracted from the candidate response.
+    :type candidateAction: str or None
+    :param primaryContent: Raw content string from the primary LLM message.
+    :type primaryContent: str
+    :param candidateContent: Raw content string from the candidate LLM message.
+    :type candidateContent: str
     """
     ts = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(_dbPath()) as db:

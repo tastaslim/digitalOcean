@@ -6,18 +6,15 @@ from app.resources.proxy.proxyService import proxyChat
 
 async def handleChatRequest(payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Delegate the chat payload to proxyChat and translate upstream HTTP errors
-    into FastAPI HTTPExceptions so the global exception handler can format them.
+    Delegate the chat payload to :func:`proxyChat` and translate upstream HTTP
+    errors into FastAPI ``HTTPException`` so the global handler can format them.
 
-    Args:
-        payload: Validated, model-stripped OpenAI-compatible request body.
-
-    Returns:
-        The primary LLM's raw response dict.
-
-    Raises:
-        HTTPException 4xx/5xx: Forwarded from a non-2xx primary LLM response.
-        HTTPException 502: Primary LLM was unreachable at the transport layer.
+    :param payload: Validated, model-stripped OpenAI-compatible request body.
+    :type payload: dict[str, Any]
+    :return: The primary LLM's raw response dict.
+    :rtype: dict[str, Any]
+    :raises HTTPException: 4xx/5xx forwarded from a non-2xx primary LLM response,
+        or 502 if the primary LLM was unreachable at the transport layer.
     """
     try:
         return await proxyChat(payload)

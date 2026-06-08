@@ -2,7 +2,12 @@ import asyncio
 
 
 class MetricsStore:
-    """Thread-safe in-memory counters for proxy and shadow execution stats."""
+    """
+    Thread-safe in-memory counters for proxy and shadow execution statistics.
+
+    All mutating methods acquire ``_lock`` so the store is safe to read and
+    write from concurrent asyncio tasks without data races.
+    """
 
     def __init__(self) -> None:
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -13,17 +18,21 @@ class MetricsStore:
         self.shedCount: int = 0
 
     async def incrementRequests(self) -> None:
-        """Atomically increment the total request counter."""
+        """
+        Atomically increment the total inbound request counter.
+        """
         async with self._lock:
             self.totalRequests += 1
 
     async def recordShadowResult(self, *, error: bool, exactMatch: bool = False) -> None:
         """
-        Atomically record the outcome of one shadow execution.
+        Atomically record the outcome of one completed shadow execution.
 
-        Args:
-            error: True if the candidate call failed or timed out.
-            exactMatch: True if both models returned valid JSON and `action` keys matched.
+        :param error: ``True`` if the candidate call failed or timed out.
+        :type error: bool
+        :param exactMatch: ``True`` if both models returned valid JSON and
+            their ``action`` keys matched exactly.
+        :type exactMatch: bool
         """
         async with self._lock:
             self.shadowCompleted += 1
@@ -33,7 +42,11 @@ class MetricsStore:
                 self.exactMatches += 1
 
     async def recordShed(self) -> None:
-        """Atomically increment the load-shed counter."""
+        """
+        Atomically increment the load-shed counter.
+
+        Called whenever a shadow task is dropped because the pool is at capacity.
+        """
         async with self._lock:
             self.shedCount += 1
 
@@ -41,9 +54,9 @@ class MetricsStore:
         """
         Return a point-in-time copy of all counters.
 
-        Returns:
-            Dict with totalRequests, shadowErrors, shadowCompleted,
-            exactMatchRatePct, and shedCount.
+        :return: Dict containing ``totalRequests``, ``shadowErrors``,
+            ``shadowCompleted``, ``exactMatchRatePct``, and ``shedCount``.
+        :rtype: dict[str, int or float]
         """
         matchRate: float = (
             round(self.exactMatches / self.shadowCompleted * 100, 2)
