@@ -1,8 +1,23 @@
-import pytest
+import os
+from pathlib import Path
 
-from app.resources.config.configService import runtimeConfig
-from app.resources.metrics.metricsService import metricsStore
-from app.resources.proxy.proxyService import shadowPool
+# ---------------------------------------------------------------------------
+# Load cloud.env.example before any app module is imported so pydantic-settings
+# has the required fields. Real credentials in cloud.env take precedence when
+# present (os.environ.setdefault never overwrites an already-set variable).
+# ---------------------------------------------------------------------------
+_exampleEnv = Path(__file__).parent.parent / "cloud.env.example"
+for _line in _exampleEnv.read_text().splitlines():
+    _line = _line.strip()
+    if _line and not _line.startswith("#") and "=" in _line:
+        _key, _, _val = _line.partition("=")
+        os.environ.setdefault(_key.strip(), _val.strip())
+
+import pytest  # noqa: E402
+
+from app.resources.config.configService import runtimeConfig  # noqa: E402
+from app.resources.metrics.metricsService import metricsStore  # noqa: E402
+from app.resources.proxy.proxyService import shadowPool  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared fixture data
