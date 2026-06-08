@@ -216,11 +216,72 @@ curl -s -X PUT http://localhost:8000/config \
 
 Subsequent `/v1/chat` calls now return instantly with zero shadow overhead.
 
-### Step 7 — Inspect SQLite mismatches (if any)
+### Step 7 — Inspect and verify the SQLite mismatch store
+
+**Read all rows (Python — no sqlite3 CLI required):**
 
 ```bash
-sqlite3 mismatches.db "SELECT timestamp, primaryAction, candidateAction FROM mismatches LIMIT 10;"
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('mismatches.db')
+c = conn.cursor()
+c.execute('SELECT id, timestamp, primaryAction, candidateAction, primaryContent, candidateContent FROM mismatches ORDER BY id')
+rows = c.fetchall()
+print(f'--- {len(rows)} rows in mismatches table ---')
+for r in rows:
+    print(f'[{r[0]}] {r[1]}')
+    print(f'    primaryAction  : {r[2]}')
+    print(f'    candidateAction: {r[3]}')
+    print(f'    primaryContent : {r[4]}')
+    print(f'    candidateContent: {r[5]}')
+    print()
+conn.close()
+"
 ```
+
+Expected output after a mismatch has been recorded:
+
+```
+--- 1 rows in mismatches table ---
+[1] 2026-06-08T06:24:01.457619+00:00
+    primaryAction  : buy
+    candidateAction: sell
+    primaryContent : {"action": "buy", "reason": "momentum positive"}
+    candidateContent: {"action": "sell", "reason": "risk too high"}
+```
+
+**Seed a mismatch row directly (simulate what the shadow evaluator writes):**
+
+```bash
+python3 -c "
+import asyncio, aiosqlite
+from datetime import datetime, timezone
+
+async def insert():
+    ts = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect('mismatches.db') as db:
+        await db.execute(
+            'INSERT INTO mismatches '
+            '(timestamp, primaryAction, candidateAction, primaryContent, candidateContent) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (ts, 'approve', 'deny',
+             '{\"action\": \"approve\", \"confidence\": 0.9}',
+             '{\"action\": \"deny\", \"confidence\": 0.3}')
+        )
+        await db.commit()
+        async with db.execute('SELECT COUNT(*) FROM mismatches') as cur:
+            print('Total rows now:', (await cur.fetchone())[0])
+
+asyncio.run(insert())
+"
+```
+
+Re-run the read snippet above to confirm the row is present. This is useful for:
+
+- Verifying the schema is intact after a restart.
+- Checking that `recordMismatch()` in `app/core/database.py` produces the expected
+  column layout before running against live models.
+- Seeding rows to test any downstream tooling that consumes `mismatches.db`.
 
 ---
 
