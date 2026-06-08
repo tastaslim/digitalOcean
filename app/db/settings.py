@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     SHADOW_TIMEOUT_SECONDS: int = 30
     MAX_CONCURRENT_SHADOWS: int = 50
+    MISMATCH_DB_PATH: str = "mismatches.db"
 
     def primaryKey(self) -> str:
         """Return the effective API key for the primary LLM endpoint."""

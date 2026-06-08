@@ -1,7 +1,7 @@
 import aiosqlite
 from datetime import datetime, timezone
 
-DB_PATH = "mismatches.db"
+from app.db.settings import getSettings
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS mismatches (
@@ -15,9 +15,13 @@ CREATE TABLE IF NOT EXISTS mismatches (
 """
 
 
+def _dbPath() -> str:
+    return getSettings().MISMATCH_DB_PATH
+
+
 async def initDb() -> None:
     """Create the mismatches table if it does not already exist."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_dbPath()) as db:
         await db.execute(_CREATE_TABLE)
         await db.commit()
 
@@ -38,7 +42,7 @@ async def recordMismatch(
         candidateContent: Raw content string from the candidate LLM message.
     """
     ts = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_dbPath()) as db:
         await db.execute(
             "INSERT INTO mismatches "
             "(timestamp, primaryAction, candidateAction, primaryContent, candidateContent) "

@@ -1,0 +1,30 @@
+# version control
+.git
+.github
+
+# local secrets — never bake into the image
+cloud.env
+
+# development artefacts
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# test suite — not needed at runtime
+tests/
+pytest.ini
+
+# editor / OS
+.vscode/
+.DS_Store
+*.swp
+
+# SQLite debug file — persisted via Docker volume instead
+mismatches.db
+
+# docs
+README.md
+cloud.env.example

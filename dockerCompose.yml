@@ -1,8 +1,53 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-shadow-proxy:latest
     ports:
       - "8000:8000"
+
+    # Real credentials — never committed; copy cloud.env.example → cloud.env
     env_file:
       - cloud.env
+
+    # Point the SQLite mismatch DB at the named volume mount
+    environment:
+      MISMATCH_DB_PATH: /data/mismatches.db
+
+    # Persist mismatch rows across container restarts
+    volumes:
+      - mismatch_data:/data
+
     restart: unless-stopped
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # Cap memory to enforce the bounded-concurrency contract:
+    # MAX_CONCURRENT_SHADOWS tasks × ~10 MB each + base ≈ well within 512 MB.
+    # Raise if you increase MAX_CONCURRENT_SHADOWS significantly.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+        reservations:
+          memory: 128m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mismatch_data:
+    driver: local
