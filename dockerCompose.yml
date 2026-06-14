@@ -1,5 +1,44 @@
+# Full distributed stack for testing the proxy like production:
+#   app        — FastAPI proxy (publish side): serves /v1/chat, publishes
+#                shadow events to SNS, stores primary response in S3.
+#   worker     — standalone ShadowWorker (consume side): long-polls SQS,
+#                calls the candidate LLM, runs comparison. Scale with --scale.
+#   postgres   — durable mismatch + shadow_tasks checkpoint store.
+#   redis      — distributed metrics/runtime-config cache.
+#   localstack — SNS + SQS + S3 emulator (AWS-compatible).
+#
+# Bring up:   docker compose -f dockerCompose.yml up --build
+# Tear down:  docker compose -f dockerCompose.yml down -v
+
+# ── Shared backend wiring (anchored into both app and worker) ──────────────
+x-aws-env: &aws-env
+  # Persistent DB
+  DB_BACKEND: postgres
+  DATABASE_URL: postgresql://shadow:shadow@postgres:5432/shadow
+
+  # Distributed cache
+  CACHE_BACKEND: redis
+  REDIS_URL: redis://redis:6379
+
+  # Blob storage (archives) via LocalStack S3
+  STORAGE_BACKEND: s3
+  S3_BUCKET: shadow-events
+  S3_PREFIX: shadow-events
+
+  # Distributed queue via LocalStack SNS + SQS
+  QUEUE_BACKEND: sqs
+  # Deterministic LocalStack ARNs/URLs created by scripts/localstack-init.sh
+  SNS_SHADOW_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:shadow-events
+  SQS_QUEUE_URL: http://localstack:4566/000000000000/shadow-tasks
+
+  # AWS / LocalStack credentials + endpoint
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_ENDPOINT_URL: http://localstack:4566
+
 services:
-  # ── Application ───────────────────────────────────────────────────────────
+  # ── Application (publish side) ─────────────────────────────────────────────
   app:
     build:
       context: .
@@ -8,40 +47,12 @@ services:
     ports:
       - "8000:8000"
 
-    # Base config (LLM keys, model names) comes from cloud.env.
-    # Everything below overrides cloud.env to wire the app to the
-    # containerised services defined in this file.
+    # Base config (LLM keys, model names) comes from cloud.env; the anchor
+    # below overrides the backend selection to target the containerised services.
     env_file:
       - cloud.env
     environment:
-      # ── Persistent DB ─────────────────────────────────────────────────
-      DB_BACKEND: postgres
-      DATABASE_URL: postgresql://shadow:shadow@postgres:5432/shadow
-
-      # ── Distributed cache ─────────────────────────────────────────────
-      CACHE_BACKEND: redis
-      REDIS_URL: redis://redis:6379
-
-      # ── Blob storage (archives) via LocalStack S3 ─────────────────────
-      STORAGE_BACKEND: s3
-      S3_BUCKET: shadow-events
-      S3_PREFIX: shadow-events
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_ENDPOINT_URL: http://localstack:4566
-
-      # ── Queue (in-process for single-node; switch to sqs for scale-out)
-      # For multi-process SQS deployment set:
-      #   QUEUE_BACKEND: sqs
-      #   SNS_SHADOW_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:shadow-events
-      QUEUE_BACKEND: memory
-
-      # ── SQLite path is irrelevant when DB_BACKEND=postgres, but set anyway
-      MISMATCH_DB_PATH: /data/mismatches.db
-
-    volumes:
-      - app_data:/data
+      <<: *aws-env
 
     depends_on:
       redis:
@@ -63,6 +74,51 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+        reservations:
+          memory: 128m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Shadow worker (consume side) ───────────────────────────────────────────
+  # Separate process so the candidate LLM call never shares the request path.
+  # Scale horizontally:  docker compose -f dockerCompose.yml up --scale worker=3
+  worker:
+    image: llm-shadow-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.worker"]
+
+    env_file:
+      - cloud.env
+    environment:
+      <<: *aws-env
+
+    # The worker is an SQS consumer with no HTTP server, so the image's
+    # HTTP HEALTHCHECK does not apply — disable it. Liveness for a queue
+    # consumer is better handled by orchestrator restarts (restart policy
+    # below) or a queue-depth alarm than by an in-container probe.
+    healthcheck:
+      disable: true
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      app:
+        condition: service_started
+
+    restart: unless-stopped
 
     deploy:
       resources:
@@ -110,8 +166,8 @@ services:
       timeout: 3s
       retries: 10
 
-  # ── LocalStack (STORAGE_BACKEND=s3 / optional QUEUE_BACKEND=sqs) ─────────
-  # Bootstrap script (scripts/localstack-init.sh) runs on startup and creates:
+  # ── LocalStack (SNS + SQS + S3) ───────────────────────────────────────────
+  # scripts/localstack-init.sh runs on startup and creates:
   #   - SNS topic:  shadow-events
   #   - SQS queue:  shadow-tasks  (subscribed to the topic)
   #   - S3 bucket:  shadow-events
@@ -125,6 +181,9 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
+      # Path-style queue URLs (http://localstack:4566/000000000000/shadow-tasks)
+      # so the deterministic SQS_QUEUE_URL above resolves on the docker network.
+      SQS_ENDPOINT_STRATEGY: path
     volumes:
       - localstack_data:/var/lib/localstack
       - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
@@ -138,8 +197,6 @@ services:
       start_period: 15s
 
 volumes:
-  app_data:
-    driver: local
   redis_data:
     driver: local
   postgres_data:

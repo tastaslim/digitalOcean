@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     # per-model SQS queues via infrastructure-managed subscriptions.
     SNS_SHADOW_TOPIC_ARN: str = ""
 
+    # Full SQS queue URL the shadow worker long-polls (consume side). Required
+    # when running the standalone worker with QUEUE_BACKEND=sqs. The proxy
+    # (publish side) does not need it.
+    SQS_QUEUE_URL: str = ""
+
     # Optional endpoint override — set to http://localstack:4566 when running
     # LocalStack so boto3 targets the local emulator instead of real AWS.
     AWS_ENDPOINT_URL: str = ""

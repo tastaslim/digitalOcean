@@ -1,16 +1,19 @@
 import asyncio
+import json
 import logging
+import time
 from datetime import datetime, timezone
 from uuid import UUID
 
 from app.core.llmClient import _getContent, _parseAction
 from app.core.shadowPool import ShadowPool
-from app.domain.evaluators.registry import EvaluatorRegistry
-from app.domain.models.enums import EvalStatus, TaskType
-from app.domain.models.task import ActionResult, TaskResponse
-from app.ports.database import MismatchRecord, MismatchRepository
+from app.domain.comparison import runComparison
+from app.domain.models.enums import TaskType
+from app.ports.blobStorage import BlobStoragePort
+from app.ports.database import MismatchRepository
 from app.ports.llm import LlmPort
 from app.ports.messageQueue import Message, MessageQueuePort
+from app.ports.shadowTask import ShadowTaskRepository
 from app.resources.metrics.metricsService import MetricsService
 
 logger = logging.getLogger(__name__)
@@ -20,16 +23,22 @@ SHADOW_TASKS_QUEUE = "shadow.tasks:{modelId}"
 
 class ShadowWorker:
     """
-    Separate background service that consumes shadow events from the queue,
-    calls the candidate LLM, runs domain-aware evaluation, and records
-    mismatches and metrics.
+    Background service that consumes shadow events from the queue, calls the
+    candidate LLM, and coordinates comparison with the proxy side.
 
-    The proxy (control plane) never calls the candidate — it only publishes
-    messages + primaryResponse to the queue and returns immediately to the
-    client. This service handles everything after that, independently and
-    at its own scale.
+    Variant B pipeline:
+      Queue message contains only {taskId, taskType, messages} — no primary
+      response. The candidate call starts as soon as the message is dequeued,
+      which can overlap with the primary LLM call still running in the proxy.
 
-    The candidate LLM provider is injected as a LlmPort. Swap providers by
+      After the candidate call:
+        1. Store result in blob storage.
+        2. Upsert candidate result into shadow_tasks checkpoint row.
+        3. Call tryClaimComparison() — atomic gate shared with the proxy side.
+           If both primary and candidate are done, exactly one caller wins.
+        4. Winner fetches the full task row and runs domain comparison.
+
+    The candidate LLM provider is injected as a LlmPort — swap providers by
     changing CANDIDATE_LLM_* in cloud.env without touching this code.
     """
 
@@ -37,19 +46,30 @@ class ShadowWorker:
         self,
         queue: MessageQueuePort,
         mismatchRepo: MismatchRepository,
+        shadowTaskRepo: ShadowTaskRepository,
+        storage: BlobStoragePort,
         metrics: MetricsService,
         candidateLlm: LlmPort,
         maxConcurrent: int = 50,
         contentMaxChars: int = 2000,
+        queueName: str | None = None,
     ) -> None:
         self._queue = queue
         self._mismatchRepo = mismatchRepo
+        self._shadowTaskRepo = shadowTaskRepo
+        self._storage = storage
         self._metrics = metrics
         self.candidateLlm = candidateLlm  # public for test access via patch.object
         self._contentMaxChars = contentMaxChars
+        self._queueNameOverride = queueName
         self.pool = ShadowPool(maxConcurrent=maxConcurrent)
 
     def queueName(self) -> str:
+        # SQS needs a concrete queue URL (passed in via SQS_QUEUE_URL); the
+        # in-memory adapter uses the logical per-model name and matches it
+        # against the publish topic by prefix.
+        if self._queueNameOverride:
+            return self._queueNameOverride
         return SHADOW_TASKS_QUEUE.format(modelId=self.candidateLlm.modelId)
 
     async def start(self) -> None:
@@ -65,7 +85,10 @@ class ShadowWorker:
         )
 
     async def _handle(self, message: Message) -> None:
-        submitted = await self.pool.submit(self._evaluate(message.body))
+        taskId = message.body.get("taskId", "unknown")
+        submitted = await self.pool.submit(
+            self._evaluate(message.body), name=f"shadow-eval-{taskId}"
+        )
         if not submitted:
             await self._metrics.recordShed()
 
@@ -81,23 +104,10 @@ class ShadowWorker:
     async def _runEvaluation(self, body: dict) -> None:
         taskType = TaskType(body["taskType"])
         messages = body["messages"]
-        primaryRaw = body["primaryResponse"]
+        taskId = body["taskId"]
 
-        # Full LLM content can be several KB. Truncate before storing in the DB
-        # row — the complete text already lives in the S3 archive keyed by taskId.
-        primaryRawContent = (primaryRaw.get("rawContent", ""))[:self._contentMaxChars]
-
-        primaryResponse = TaskResponse(
-            taskId=UUID(body["taskId"]) if isinstance(body["taskId"], str) else body["taskId"],
-            model=primaryRaw["model"],
-            action=ActionResult(
-                decision=primaryRaw.get("decision", ""),
-                rawContent=primaryRawContent,
-            ),
-            latencyMs=primaryRaw.get("latencyMs", 0),
-            rawContent=primaryRawContent,
-        )
-
+        # Candidate call — may overlap with the primary LLM still running in proxy.
+        start = time.monotonic()
         try:
             candidateRaw = await asyncio.wait_for(
                 self.candidateLlm.chat(messages),
@@ -107,41 +117,47 @@ class ShadowWorker:
             logger.warning(
                 "Candidate LLM %s failed for task %s: %s",
                 self.candidateLlm.modelId,
-                body.get("taskId"),
+                taskId,
                 exc,
             )
             await self._metrics.recordShadowResult(error=True)
             return
 
+        candidateLatencyMs = int((time.monotonic() - start) * 1000)
         candidateContent = _getContent(candidateRaw)[:self._contentMaxChars]
-        candidateResponse = TaskResponse(
-            taskId=primaryResponse.taskId,
-            model=self.candidateLlm.modelId,
-            action=_parseAction(candidateContent),
-            latencyMs=0,
-            rawContent=candidateContent,
+        candidateAction = _parseAction(candidateContent)
+
+        # Store candidate response in blob storage.
+        now = datetime.now(timezone.utc)
+        candidateS3Path = (
+            f"tasks/{taskType.value}/{now.strftime('%Y/%m/%d')}/{taskId}/candidate.json"
+        )
+        await self._storage.put(
+            candidateS3Path,
+            json.dumps({
+                "model": self.candidateLlm.modelId,
+                "decision": candidateAction.decision,
+                "rawContent": candidateContent,
+                "latencyMs": candidateLatencyMs,
+                "timestamp": now.isoformat(),
+            }).encode(),
         )
 
-        evaluator = EvaluatorRegistry.get(taskType)
-        result = await evaluator.evaluate(primaryResponse, candidateResponse)
-
-        if result.isMismatch and result.status != EvalStatus.PARSE_ERROR:
-            record = MismatchRecord(
-                taskId=primaryResponse.taskId,
-                taskType=taskType,
-                primaryModel=primaryResponse.model,
-                candidateModel=self.candidateLlm.modelId,
-                primaryAction=primaryResponse.action.decision,
-                candidateAction=candidateResponse.action.decision,
-                primaryContent=primaryResponse.rawContent,
-                candidateContent=candidateContent,
-                severity=result.severity,
-                diffFields=result.diffFields,
-                timestamp=datetime.now(timezone.utc),
-            )
-            await self._mismatchRepo.save(record)
-
-        await self._metrics.recordShadowResult(
-            error=(result.status == EvalStatus.ERROR),
-            exactMatch=result.isExactMatch,
+        # Upsert candidate result into the checkpoint row.
+        await self._shadowTaskRepo.upsertCandidateDone(
+            taskId=taskId,
+            taskType=taskType,
+            candidateS3Path=candidateS3Path,
+            candidateModel=self.candidateLlm.modelId,
+            candidateAction=candidateAction.decision,
+            candidateContent=candidateContent,
+            candidateLatencyMs=candidateLatencyMs,
         )
+
+        # Atomic claim: returns True only if primary is already done and no
+        # one else has claimed yet. This side wins the comparison race.
+        claimed = await self._shadowTaskRepo.tryClaimComparison(taskId)
+        if claimed:
+            task = await self._shadowTaskRepo.getTask(taskId)
+            if task:
+                await runComparison(task, self._mismatchRepo, self._shadowTaskRepo, self._metrics)

@@ -37,7 +37,7 @@ class InMemoryQueueAdapter(MessageQueuePort):
                     async with s:
                         await h(m)
 
-                asyncio.create_task(_dispatch())
+                asyncio.create_task(_dispatch(), name=f"queue-dispatch-{msgId[:8]}")
         return msgId
 
     async def startConsumer(

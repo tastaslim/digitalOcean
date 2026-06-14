@@ -12,32 +12,44 @@ This service is the infrastructure that makes that happen at scale (millions of 
 
 ## High-Level Design (HLD)
 
+This is **Variant B**: the proxy publishes the shadow event to the queue
+**before** it awaits the primary LLM, so the candidate call runs *in parallel*
+with primary instead of after it. Both sides write their result into a shared
+`shadow_tasks` checkpoint row and then race to run the comparison — an atomic
+claim guarantees it happens exactly once, on whichever side finishes last.
+
 ```mermaid
 graph TD
     Client(["👤 Client"])
-    Proxy["Proxy Service\n(control plane)\nPOST /v1/chat\nGET /metrics\nPUT /config"]
+    Proxy["Proxy Service\n(publish side)\nPOST /v1/chat\nGET /metrics\nPUT /config"]
     PrimaryLLM(["🧠 Primary LLM\n(GPT-4 / current model)"])
-    Queue[["📬 Message Queue\n(SQS in prod\nin-memory in dev)"]]
-    Worker["Shadow Worker Service\n(background consumer)"]
+    Queue[["📬 SNS topic → SQS\n(in-memory in dev)"]]
+    Worker["Shadow Worker Service\n(consume side)"]
     CandidateLLM(["🧠 Candidate LLM\n(new model under test)"])
-    Evaluator["Domain Evaluator\nGENERIC / JOB_CANCEL\nORDER_CANCEL"]
+    Checkpoint[("🗄️ shadow_tasks\ncheckpoint + atomic claim\n(PostgreSQL / SQLite)")]
+    Compare["runComparison()\nDomain Evaluator\nGENERIC / JOB_CANCEL / ORDER_CANCEL"]
     DB[("🗄️ Mismatch DB\n(PostgreSQL / SQLite)")]
     Cache[("⚡ Cache\n(Redis / in-memory)\nMetrics + Config")]
-    Storage[("🪣 Blob Storage\n(S3 / local)\nRaw archives")]
+    Storage[("🪣 Blob Storage\n(S3 / local)\nprimary.json + candidate.json")]
 
     Client -->|"POST /v1/chat"| Proxy
-    Proxy -->|"1 — await (blocking)"| PrimaryLLM
+    Proxy -.->|"1 — publish FIRST\n{taskId, taskType, messages}"| Queue
+    Proxy -->|"2 — await (blocking)"| PrimaryLLM
     PrimaryLLM -->|"response"| Proxy
-    Proxy -->|"2 — return immediately"| Client
-    Proxy -.->|"3 — fire & forget\ncreate_task"| Queue
-    Proxy -.->|"4 — fire & forget\ncreate_task"| Storage
-    Proxy -.->|"5 — fire & forget\ncreate_task"| Cache
-    Queue -->|"dequeue"| Worker
+    Proxy -->|"3 — return immediately"| Client
+
+    Queue -->|"dequeue (parallel with primary)"| Worker
     Worker -->|"call candidate LLM"| CandidateLLM
     CandidateLLM -->|"response"| Worker
-    Worker --> Evaluator
-    Evaluator -->|"mismatch"| DB
-    Evaluator -->|"metrics"| Cache
+
+    Proxy -.->|"4a — archive primary"| Storage
+    Worker -.->|"4b — archive candidate"| Storage
+    Proxy -.->|"5a — upsertPrimaryDone\n+ tryClaimComparison"| Checkpoint
+    Worker -.->|"5b — upsertCandidateDone\n+ tryClaimComparison"| Checkpoint
+
+    Checkpoint -->|"winner of atomic claim"| Compare
+    Compare -->|"mismatch"| DB
+    Compare -->|"metrics"| Cache
 
     style Client fill:#4a90d9,color:#fff
     style PrimaryLLM fill:#7b68ee,color:#fff
@@ -45,17 +57,24 @@ graph TD
     style Queue fill:#f0ad4e,color:#000
     style Worker fill:#5cb85c,color:#fff
     style Proxy fill:#5bc0de,color:#000
-    style Evaluator fill:#5cb85c,color:#fff
+    style Compare fill:#5cb85c,color:#fff
+    style Checkpoint fill:#d9534f,color:#fff
     style DB fill:#d9534f,color:#fff
     style Cache fill:#d9534f,color:#fff
     style Storage fill:#d9534f,color:#fff
 ```
 
 > Solid arrows = **blocking** (user waits). Dashed arrows = **fire-and-forget** (user doesn't wait).
+> Note step **1** (publish) happens *before* step **2** (await primary), so primary and candidate run concurrently.
 
 ---
 
 ## Request Sequence Diagram
+
+In Variant B the candidate call (worker) runs **concurrently** with the
+primary call (proxy). Both sides write to the `shadow_tasks` checkpoint and
+call `tryClaimComparison()`; the side that finishes last gets `claimed=true`
+and runs the comparison once.
 
 ```mermaid
 sequenceDiagram
@@ -63,48 +82,55 @@ sequenceDiagram
     actor Client
     participant Proxy as Proxy Service
     participant PrimaryLLM as Primary LLM
-    participant Queue as SQS Queue
+    participant Queue as SNS→SQS
     participant Worker as Shadow Worker
     participant CandidateLLM as Candidate LLM
-    participant Evaluator as Domain Evaluator
+    participant Chk as shadow_tasks (DB)
+    participant Storage as Blob Storage
     participant DB as Mismatch DB
     participant Cache as Redis Cache
 
     Client->>Proxy: POST /v1/chat {messages}
-
     Note over Proxy: getShadowPercentage() — Redis read ~0.5ms
 
-    Proxy->>PrimaryLLM: call primary model
-    PrimaryLLM-->>Proxy: primary response
+    Proxy-)Queue: publish {taskId, taskType, messages}  (BEFORE awaiting primary)
 
-    Proxy-->>Client: 🟢 return response immediately
-    Note over Client,Proxy: Client is DONE. Everything below is background.
-
-    par fire-and-forget background tasks
-        Proxy-)Queue: publish {taskId, messages, primaryResponse}
+    par primary path (blocking, user waits)
+        Proxy->>PrimaryLLM: call primary model
+        PrimaryLLM-->>Proxy: primary response
+        Proxy-->>Client: 🟢 return response immediately
+        Note over Client,Proxy: Client is DONE. Everything below is background.
         Proxy-)Cache: increment totalRequests
-        Proxy-)DB: archive raw event to blob storage
-    end
-
-    Queue-)Worker: dequeue message
-
-    Note over Worker: ShadowPool.submit() — check if under MAX_CONCURRENT_SHADOWS cap
-    alt pool has capacity
-        Worker->>CandidateLLM: call candidate model (timeout-bounded)
-        CandidateLLM-->>Worker: candidate response
-
-        Worker->>Evaluator: evaluate(primaryResponse, candidateResponse)
-
-        alt responses match
-            Evaluator->>Cache: recordShadowResult(exactMatch=true)
-        else responses differ
-            Evaluator->>DB: save MismatchRecord
-            Evaluator->>Cache: recordShadowResult(exactMatch=false)
+        Proxy-)Storage: archive primary.json
+        Proxy->>Chk: upsertPrimaryDone(taskId)
+        Proxy->>Chk: tryClaimComparison(taskId)
+    and candidate path (parallel, in the worker)
+        Queue-)Worker: dequeue message
+        Note over Worker: ShadowPool.submit() — under MAX_CONCURRENT_SHADOWS cap?
+        alt pool has capacity
+            Worker->>CandidateLLM: call candidate model (timeout-bounded)
+            CandidateLLM-->>Worker: candidate response
+            Worker-)Storage: archive candidate.json
+            Worker->>Chk: upsertCandidateDone(taskId)
+            Worker->>Chk: tryClaimComparison(taskId)
+        else pool full — traffic spike protection
+            Worker->>Cache: recordShed()
+            Note over Worker: coroutine dropped, no memory leak
         end
-    else pool full — traffic spike protection
-        Worker->>Cache: recordShed()
-        Note over Worker: coroutine dropped, no memory leak
     end
+
+    Note over Chk: exactly ONE side wins the atomic claim (both done + not yet claimed)
+    Chk-->>Proxy: claimed=true (if proxy finished last)
+    Chk-->>Worker: claimed=true (if worker finished last)
+
+    Note over Proxy,Worker: the winner runs runComparison(task)
+    alt responses match
+        Proxy->>Cache: recordShadowResult(exactMatch=true)
+    else responses differ
+        Proxy->>DB: save MismatchRecord
+        Proxy->>Cache: recordShadowResult(exactMatch=false)
+    end
+    Proxy->>Chk: markComparisonDone(taskId)
 ```
 
 ---
@@ -113,34 +139,39 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([Request arrives]) --> B[Call PRIMARY LLM]
+    A([Request arrives]) --> SC{Shadow\nsampling\ncheck}
+    SC -->|sampled| PUB[Publish to queue\n{taskId, taskType, messages}\nfire-and-forget]
+    SC -->|not sampled| B0[Call PRIMARY LLM]
+    PUB --> B[Call PRIMARY LLM]
+
     B --> C[Return response to client]
-    C --> D{Shadow\nsampling\ncheck}
+    B0 --> C0([Return response — no shadow])
 
-    D -->|random % < shadowPercentage| E[Publish to queue\nfire-and-forget]
-    D -->|not sampled| F([Done — no shadow])
+    C --> AP[Archive primary.json\nupsertPrimaryDone]
+    AP --> CLP[tryClaimComparison]
 
-    E --> G[Archive to blob storage\nfire-and-forget]
-    G --> H([Client already got\ntheir response])
-
-    E --> I[Worker dequeues message]
+    PUB -.parallel.-> I[Worker dequeues message]
     I --> J{ShadowPool\ncapacity?}
-
     J -->|pool full| K[Drop + increment shedCount]
     J -->|capacity available| L[Call CANDIDATE LLM]
-
     L --> M{Candidate\nreturned OK?}
     M -->|timeout or error| N[increment shadowErrors]
-    M -->|success| O[Run domain evaluator]
+    M -->|success| AC[Archive candidate.json\nupsertCandidateDone]
+    AC --> CLC[tryClaimComparison]
+
+    CLP --> WON{Won the\natomic claim?}
+    CLC --> WON
+    WON -->|no — other side will run it| Z([Done])
+    WON -->|yes — both sides done| O[runComparison\ndomain evaluator]
 
     O --> P{Responses\nmatch?}
     P -->|exact match| Q[increment exactMatches]
     P -->|mismatch| R[Save MismatchRecord to DB]
-    R --> S[increment shadowCompleted]
+    R --> S[markComparisonDone\nincrement shadowCompleted]
     Q --> S
 
     style C fill:#2d8a4e,color:#fff
-    style H fill:#2d8a4e,color:#fff
+    style C0 fill:#2d8a4e,color:#fff
     style K fill:#c0392b,color:#fff
     style N fill:#c0392b,color:#fff
     style R fill:#e67e22,color:#fff
@@ -153,72 +184,98 @@ flowchart TD
 User sends a request
         │
         ▼
-┌───────────────────┐
-│   Shadow Proxy    │
-│                   │
-│ 1. Ask PRIMARY    │──────────────────► User gets this response immediately
-│    model (GPT-4)  │                    (user never waits for anything else)
-│                   │
-│ 2. In background: │
-│    publish to SQS │
-└───────────────────┘
-          │
-          │  (completely separate service — user is already done)
-          ▼
-┌───────────────────────┐
-│   Shadow Worker       │
-│                       │
-│ 3. Ask CANDIDATE      │
-│    model (new LLM)    │
-│                       │
-│ 4. Compare answers    │
-│    ✓ Same → log match │
-│    ✗ Diff → log alert │
-└───────────────────────┘
+┌────────────────────────┐
+│   Shadow Proxy         │
+│                        │      ┌──────────────────────────────────────────┐
+│ 1. Publish to SQS  ────┼─────►│  Shadow Worker (separate service)        │
+│    {taskId, messages}  │      │                                          │
+│       (BEFORE primary) │      │ 2. Ask CANDIDATE model   ◄── runs in     │
+│                        │      │    (new LLM)                 PARALLEL     │
+│ 2. Ask PRIMARY model ──┼──►   │ 3. Archive candidate.json    with primary│
+│    (GPT-4)             │ User │ 4. upsertCandidateDone                   │
+│       returns to user  │ done │ 5. tryClaimComparison ──┐                │
+│ 3. Archive primary.json│      └─────────────────────────┼────────────────┘
+│ 4. upsertPrimaryDone   │                                │
+│ 5. tryClaimComparison ─┼────────────────┐               │
+└────────────────────────┘                ▼               ▼
+                               ┌──────────────────────────────────────┐
+                               │  shadow_tasks (atomic claim)          │
+                               │  exactly ONE side wins → compare:     │
+                               │    ✓ Same → record match              │
+                               │    ✗ Diff → save MismatchRecord       │
+                               └──────────────────────────────────────┘
 ```
 
 ---
 
 ## The critical design rule: respond to the user first, do everything else later
 
-The proxy does **one** blocking thing: call the primary model and return the answer to the user. Everything else — publishing to the queue, saving to storage, incrementing counters — is scheduled as a background task after the response is already on its way.
+The proxy does **one** blocking thing: call the primary model and return the answer to the user. Everything else — publishing to the queue, saving to storage, the checkpoint write, incrementing counters — is scheduled as a background task after the response is already on its way.
 
 This is non-negotiable at scale. If SQS has a 100ms hiccup and we waited for it before responding, every user at that moment would feel that 100ms. With background tasks, users feel nothing.
 
+In Variant B there's one subtlety: the publish is fired **before** awaiting the
+primary call. Publishing is itself fire-and-forget (`safeTask`), so it doesn't
+block — but firing it first means the worker can start the candidate LLM call
+while the primary call is still in flight, cutting end-to-end shadow latency.
+
 ```python
-# What the code actually does:
-primaryResponse = await callPrimaryLLM(...)   # user waits ONLY for this
+# What the code actually does (app/resources/proxy/proxyService.py):
 
-# These three lines do NOT block the user — they're background tasks
-asyncio.create_task(publishToQueue(...))       # fire and forget
-asyncio.create_task(archiveToS3(...))          # fire and forget
-asyncio.create_task(metrics.increment())       # fire and forget
+# Fire the shadow event FIRST — fire-and-forget, candidate starts in parallel
+if doShadow:
+    safeTask(queue.publish(TOPIC, {taskId, taskType, messages}))
 
-return primaryResponse                         # user already getting this
+primaryResponse = await primaryLlm.chat(...)   # user waits ONLY for this
+
+# After returning, a background task archives + checkpoints + maybe compares
+safeTask(metrics.incrementRequests())                      # fire and forget
+safeTask(archivePrimaryAndMaybeCompare(taskId, ...))       # fire and forget
+
+return primaryResponse                          # user already getting this
 ```
+
+`archivePrimaryAndMaybeCompare` writes `primary.json` to blob storage, calls
+`upsertPrimaryDone`, then `tryClaimComparison` — and runs the comparison only if
+it wins the claim (i.e. the worker already finished the candidate side).
 
 ---
 
 ## How the two services talk to each other
 
-They don't — directly. The **queue** (AWS SQS in production, in-memory in dev/tests) is the only connection.
+They don't — directly. Two things connect them, and **neither carries the
+primary response**:
+
+1. The **queue** (SNS→SQS in production, in-memory in dev/tests) — the proxy
+   publishes a lightweight trigger so the worker can start the candidate call.
+2. The **`shadow_tasks` table** — a shared checkpoint where each side records
+   its result and atomically claims the comparison.
 
 ```
-Proxy Service                    Shadow Worker Service
-─────────────                    ─────────────────────
-Publishes a message:             Picks up that message:
-{                                calls candidate LLM,
-  taskId: "abc-123",             compares answers,
-  messages: [...],               saves mismatches to DB,
-  primaryResponse: {...}         updates metrics
+Proxy Service                         Shadow Worker Service
+─────────────                         ─────────────────────
+Publishes a TRIGGER (no response):    Picks up that message:
+{                                       calls candidate LLM,
+  taskId: "abc-123",                    archives candidate.json,
+  taskType: "GENERIC",                  upsertCandidateDone(),
+  messages: [...]                       tryClaimComparison()
 }
+
+        both sides converge on shadow_tasks
+        ──────────────────────────────────
+        is_primary_done · is_candidate_done · is_comparison_triggered
+        → whoever finishes last wins the claim and runs the comparison
 ```
+
+Why not put `primaryResponse` in the queue message (Variant A)? Because that
+would force the worker to wait for primary to finish before the candidate call
+could start. Publishing only the trigger lets the two LLM calls overlap.
 
 This means:
 - The proxy doesn't know or care what the worker does
-- The worker can be on a completely different server
-- If the worker is down, users are unaffected — messages queue up and get processed when it comes back
-- You can run 1 proxy and 10 workers if evaluations are the bottleneck
+- The worker can be on a completely different server (it is — a separate container)
+- If the worker is down, users are unaffected — messages queue up and get processed when it comes back; stalled `shadow_tasks` rows can be recovered by a re-queue job (`findStalled`)
+- You can run 1 proxy and 10 workers if evaluations are the bottleneck (`--scale worker=10`)
 
 ---
 
@@ -226,19 +283,24 @@ This means:
 
 ```
 app/
+├── main.py                 # FastAPI app (publish side); runs inline worker only when QUEUE_BACKEND=memory
+├── worker.py               # standalone shadow worker entrypoint (python -m app.worker) for QUEUE_BACKEND=sqs
+│
 ├── core/
 │   ├── llmClient.py        # shared function to call any LLM endpoint
-│   ├── shadowWorker.py     # background service: dequeues, calls candidate, evaluates
+│   ├── shadowWorker.py     # consume side: dequeues, calls candidate, archives, claims comparison
 │   └── shadowPool.py       # limits how many evaluations run at once (safety valve)
 │
 ├── domain/
+│   ├── comparison.py       # runComparison(): shared by proxy + worker, runs on the atomic-claim winner
 │   ├── models/             # data shapes: TaskRequest, TaskResponse, ActionResult, etc.
 │   └── evaluators/         # comparison logic per task type (generic, job, order)
 │
 ├── ports/                  # interfaces (abstract classes) for external systems
 │   ├── messageQueue.py     # what a queue must be able to do
 │   ├── cache.py            # what a cache must be able to do
-│   ├── database.py         # what a database must be able to do
+│   ├── database.py         # what a database must be able to do (mismatches, model fleet)
+│   ├── shadowTask.py       # ShadowTask + ShadowTaskRepository (checkpoint + atomic claim)
 │   └── blobStorage.py      # what blob storage must be able to do
 │
 ├── adapters/               # concrete implementations of those interfaces
@@ -290,8 +352,9 @@ Swap the backend with one line in `cloud.env`. Zero code changes.
 | Data | Where | Why |
 |------|-------|-----|
 | Request/response counters | Redis (or in-memory) | Needs to be fast (every request increments) and shared across multiple proxy instances |
+| Shadow task checkpoint (`shadow_tasks`) | PostgreSQL (or SQLite) | Per-task pipeline state — `is_primary_done`, `is_candidate_done`, `is_comparison_triggered` — shared by proxy + worker for the atomic comparison claim and crash recovery |
 | Mismatch records | PostgreSQL (or SQLite) | Permanent storage; needs to be queryable (show me all ORDER_CANCELLATION mismatches with CRITICAL severity) |
-| Raw request archives | S3 (or local file) | Large blobs; cheap storage; used for offline replay and debugging |
+| Raw responses (`primary.json`, `candidate.json`) | S3 (or local file) | Large blobs; cheap storage; written independently by each side; used for offline replay and debugging |
 | Shadow percentage config | Redis (or in-memory) | Needs to update live without restart; read on every request |
 
 ---
@@ -415,29 +478,45 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 Visit `http://localhost:8000/docs` for the interactive API explorer.
 
-### Option 2: Docker — all production-like services
+### Option 2: Docker — full distributed production stack
 
-Spins up the app + Redis + PostgreSQL + LocalStack (which emulates SQS and S3 locally).
+Spins up the complete distributed system: the proxy and the shadow worker run
+as **separate** containers, talking to each other only through SNS + SQS — the
+same topology you would run in production. Backends are all real services
+(PostgreSQL, Redis, S3/SQS/SNS via LocalStack), so nothing is in-process.
 
 ```bash
-# Fill in API keys first
+# Fill in your LLM API keys first
 nano cloud.env
 
-docker compose up --build
+docker compose -f dockerCompose.yml up --build
 ```
 
-Docker Compose starts services in the right order:
+> The compose file is `dockerCompose.yml` (not the default name), so every
+> command needs `-f dockerCompose.yml`.
 
 ```
 Redis ──────────────────────────────────────────────────────► healthy
 PostgreSQL ─────────────────────────────────────────────────► healthy
 LocalStack (creates SNS topic, SQS queue, S3 bucket) ───────► healthy
                                                                │
-                                                               ▼
-                                                           App starts
+                            ┌──────────────────────────────────┤
+                            ▼                                   ▼
+                    app  (publish side)              worker (consume side)
+                POST /v1/chat → SNS topic       long-polls SQS → candidate LLM
+                primary LLM + S3 archive        S3 archive + shadow_tasks + compare
 ```
 
-The startup order is enforced with health checks — the app will not start until all three dependencies report healthy.
+The proxy never calls the candidate LLM itself — it publishes one SNS message
+and returns. The separate worker consumes from SQS and runs the candidate +
+comparison. Scale the consume side independently:
+
+```bash
+docker compose -f dockerCompose.yml up --build --scale worker=3
+```
+
+Startup order is enforced with health checks — `app` and `worker` will not
+start until Redis, PostgreSQL, and LocalStack all report healthy.
 
 ---
 
@@ -481,7 +560,8 @@ AWS_REGION=us-east-1
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_ENDPOINT_URL=
-SNS_SHADOW_TOPIC_ARN=
+SNS_SHADOW_TOPIC_ARN=        # publish side (app): SNS topic to fan out shadow events
+SQS_QUEUE_URL=               # consume side (worker): SQS queue URL to long-poll
 S3_BUCKET=
 S3_PREFIX=shadow-events
 
@@ -502,10 +582,111 @@ AZURE_CONTAINER_NAME=
 
 | Service | Image | What it does |
 |---------|-------|--------------|
-| `app` | local build | The shadow proxy |
+| `app` | local build | The proxy (publish side): serves `/v1/chat`, calls the primary LLM, archives to S3, publishes the shadow event to SNS |
+| `worker` | local build | The shadow worker (consume side): runs `python -m app.worker`, long-polls SQS, calls the candidate LLM, archives to S3, and runs comparison. Scale with `--scale worker=N` |
 | `redis` | `redis:7-alpine` | Shared counters and live config. Used when `CACHE_BACKEND=redis` |
-| `postgres` | `postgres:16-alpine` | Mismatch records. Used when `DB_BACKEND=postgres`. Credentials: user/pass/db all `shadow` |
-| `localstack` | `localstack/localstack:3` | Runs SQS, SNS, S3 locally on your machine. `scripts/localstack-init.sh` creates all the required resources at startup |
+| `postgres` | `postgres:16-alpine` | Mismatch records + `shadow_tasks` checkpoint table. Used when `DB_BACKEND=postgres`. Credentials: user/pass/db all `shadow` |
+| `localstack` | `localstack/localstack:3` | Runs SQS, SNS, S3 locally. `scripts/localstack-init.sh` creates the SNS topic `shadow-events`, the SQS queue `shadow-tasks` (subscribed to the topic), and the S3 bucket `shadow-events` at startup |
+
+Both `app` and `worker` are built from the same image and share backend wiring
+via a YAML anchor in `dockerCompose.yml`; only their command differs
+(`uvicorn` vs `python -m app.worker`).
+
+---
+
+## Verifying the distributed stack step by step
+
+After `docker compose -f dockerCompose.yml up --build -d`, walk through each
+hop of the pipeline to confirm the whole distributed system works. (`COMPOSE`
+is just shorthand below.)
+
+```bash
+COMPOSE="docker compose -f dockerCompose.yml"
+```
+
+**1. Every service is healthy**
+
+```bash
+$COMPOSE ps
+# app, worker → Up;  redis, postgres, localstack → Up (healthy)
+```
+
+**2. LocalStack created the AWS resources**
+
+```bash
+$COMPOSE exec localstack awslocal sns list-topics       # → shadow-events
+$COMPOSE exec localstack awslocal sqs list-queues        # → shadow-tasks
+$COMPOSE exec localstack awslocal s3 ls                  # → shadow-events bucket
+```
+
+**3. The worker connected to SQS** (it logs the queue URL it is consuming)
+
+```bash
+$COMPOSE logs worker | grep "Shadow worker started"
+# → consuming http://localstack:4566/000000000000/shadow-tasks
+```
+
+**4. The app is up and shadowing is on**
+
+```bash
+curl -s localhost:8000/health                                    # → {"status":"ok"}
+curl -s -X PUT localhost:8000/config \
+  -H 'Content-Type: application/json' -d '{"shadowPercentage":100}'
+```
+
+**5. Send a request through the proxy** — the primary response returns immediately
+
+```bash
+curl -s -X POST localhost:8000/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Should I buy or sell?"}]}' \
+  | python3 -m json.tool
+```
+
+**6. Watch the worker consume the SQS message and call the candidate LLM**
+
+```bash
+$COMPOSE logs worker | tail -5
+# → HTTP Request: POST https://api.groq.com/... "HTTP/1.1 200 OK"
+```
+
+**7. Confirm the checkpoint row in PostgreSQL** — both sides done, comparison ran once
+
+```bash
+$COMPOSE exec postgres psql -U shadow -d shadow -c \
+  "SELECT task_id, is_primary_done, is_candidate_done, is_comparison_done,
+          primary_action, candidate_action, comparison_result
+     FROM shadow_tasks;"
+# → is_primary_done=t  is_candidate_done=t  is_comparison_done=t  comparison_result=match
+```
+
+**8. Confirm both responses were archived to S3** (independent primary + candidate writes)
+
+```bash
+$COMPOSE exec localstack awslocal s3 ls s3://shadow-events --recursive
+# → tasks/GENERIC/YYYY/MM/DD/<taskId>/primary.json
+#   tasks/GENERIC/YYYY/MM/DD/<taskId>/candidate.json
+```
+
+**9. Confirm aggregated metrics** (counters live in Redis)
+
+```bash
+curl -s localhost:8000/metrics | python3 -m json.tool
+# → totalRequests:1  shadowCompleted:1  exactMatchRatePct:100.0
+```
+
+**10. Inspect recorded mismatches** (only rows where the models disagreed)
+
+```bash
+$COMPOSE exec postgres psql -U shadow -d shadow -c \
+  "SELECT timestamp, primary_action, candidate_action, severity FROM mismatches;"
+```
+
+**Tear down** (the `-v` drops the Postgres/Redis/LocalStack volumes):
+
+```bash
+$COMPOSE down -v
+```
 
 ---
 
@@ -553,8 +734,13 @@ This mirrors the real architecture: the proxy and the shadow worker each make th
 
 ## End-to-end walkthrough
 
+For the **full distributed stack** (app + separate worker + Postgres + Redis +
+LocalStack) see [Verifying the distributed stack step by step](#verifying-the-distributed-stack-step-by-step).
+The quick local version below (single process, in-memory queue, SQLite) is the
+fastest way to see the pipeline end-to-end:
+
 ```bash
-# 1. Start the service
+# 1. Start the service (QUEUE_BACKEND=memory runs the worker in-process)
 uvicorn app.main:app --port 8000
 
 # 2. Set shadow to 100% so every request gets evaluated
@@ -567,20 +753,23 @@ curl -s -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Should I buy or sell?"}]}' \
   | python3 -m json.tool
-# → Primary model response arrives immediately
+# → Primary model response arrives immediately (candidate runs in parallel)
 
-# 4. Wait 2 seconds for the background evaluation to finish, then check metrics
+# 4. Wait a moment for the background evaluation to finish, then check metrics
 sleep 2
 curl -s http://localhost:8000/metrics | python3 -m json.tool
 # → shadowCompleted: 1, exactMatchRatePct: 100.0 (if models agreed)
 
-# 5. If using SQLite, inspect mismatch records directly
+# 5. Inspect the checkpoint + mismatch records directly (SQLite)
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('mismatches.db')
-rows = conn.execute('SELECT timestamp, primary_action, candidate_action, severity FROM mismatches').fetchall()
-for r in rows:
-    print(f'{r[0]}  primary={r[1]}  candidate={r[2]}  severity={r[3]}')
+print('shadow_tasks:')
+for r in conn.execute('SELECT task_id, is_primary_done, is_candidate_done, is_comparison_done, comparison_result FROM shadow_tasks'):
+    print(' ', r)
+print('mismatches:')
+for r in conn.execute('SELECT timestamp, primary_action, candidate_action, severity FROM mismatches'):
+    print(f'  {r[0]}  primary={r[1]}  candidate={r[2]}  severity={r[3]}')
 conn.close()
 "
 ```

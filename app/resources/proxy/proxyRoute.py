@@ -8,14 +8,19 @@ from app.common.circuitBreaker import CircuitBreaker, CircuitOpenError
 from app.infrastructure.dependencies import (
     getCircuitBreaker,
     getConfigService,
+    getContentMaxChars,
     getMetricsService,
+    getMismatchRepository,
     getPrimaryLlm,
     getQueue,
+    getShadowTaskRepository,
     getStorage,
 )
 from app.ports.blobStorage import BlobStoragePort
+from app.ports.database import MismatchRepository
 from app.ports.llm import LlmPort
 from app.ports.messageQueue import MessageQueuePort
+from app.ports.shadowTask import ShadowTaskRepository
 from app.resources.config.configService import ConfigService
 from app.resources.metrics.metricsService import MetricsService
 from app.resources.proxy.proxyDtos import ChatRequest
@@ -31,6 +36,9 @@ def _getProxyService(
     config: ConfigService = Depends(getConfigService),
     primaryLlm: LlmPort = Depends(getPrimaryLlm),
     circuitBreaker: CircuitBreaker = Depends(getCircuitBreaker),
+    shadowTaskRepo: ShadowTaskRepository = Depends(getShadowTaskRepository),
+    mismatchRepo: MismatchRepository = Depends(getMismatchRepository),
+    contentMaxChars: int = Depends(getContentMaxChars),
 ) -> ProxyService:
     return ProxyService(
         queue=queue,
@@ -39,6 +47,9 @@ def _getProxyService(
         config=config,
         primaryLlm=primaryLlm,
         circuitBreaker=circuitBreaker,
+        shadowTaskRepo=shadowTaskRepo,
+        mismatchRepo=mismatchRepo,
+        contentMaxChars=contentMaxChars,
     )
 
 

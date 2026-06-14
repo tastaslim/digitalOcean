@@ -47,6 +47,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         worker = ShadowWorker(
             queue=container.queue,
             mismatchRepo=container.mismatchRepository,
+            shadowTaskRepo=container.shadowTaskRepository,
+            storage=container.storage,
             metrics=MetricsService(cache=container.cache),
             candidateLlm=container.candidateLlm,
             maxConcurrent=settings.MAX_CONCURRENT_SHADOWS,

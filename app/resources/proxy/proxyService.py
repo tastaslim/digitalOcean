@@ -10,10 +10,13 @@ from uuid import uuid4
 from app.common.circuitBreaker import CircuitBreaker
 from app.common.taskUtils import safeTask
 from app.core.llmClient import _getContent, _parseAction
+from app.domain.comparison import runComparison
 from app.domain.models.enums import TaskType
 from app.ports.blobStorage import BlobStoragePort
+from app.ports.database import MismatchRepository
 from app.ports.llm import LlmPort
 from app.ports.messageQueue import MessageQueuePort
+from app.ports.shadowTask import ShadowTaskRepository
 from app.resources.config.configService import ConfigService
 from app.resources.metrics.metricsService import MetricsService
 
@@ -30,15 +33,20 @@ _ARCHIVE_TIMEOUT_S = 30.0
 class ProxyService:
     """
     Critical-path contract: the ONLY blocking operation is the primary LLM call
-    (wrapped with a timeout and a circuit breaker). Everything else — SQS publish,
-    S3 archive, metrics increment — is a fire-and-forget background task that
-    never touches response latency.
+    (wrapped with a timeout and a circuit breaker). Everything else is background.
 
-    The primary LLM provider is injected as a LlmPort. Swap providers (OpenAI →
-    Groq → DigitalOcean inference → …) by changing cloud.env — no code changes.
+    Variant B shadow pipeline (true parallelism):
+      1. Fire shadow queue message BEFORE awaiting the primary LLM response so
+         the worker can start the candidate call while primary is still running.
+      2. After primary responds, a background task writes the result to S3 and
+         the shadow_tasks checkpoint table, then tries to atomically claim the
+         comparison.
+      3. The worker does the same for the candidate side.
+      4. Whichever side finishes last wins the atomic claim and runs comparison
+         exactly once — no duplicate evaluations, even under concurrent load.
 
-    Extra request params (temperature, max_tokens, top_p, …) are extracted from
-    the request payload and forwarded to the primary LLM for full proxy fidelity.
+    Checkpointing via shadow_tasks means a worker crash mid-evaluation can be
+    recovered by a periodic job that re-queues stalled rows.
     """
 
     def __init__(
@@ -49,6 +57,9 @@ class ProxyService:
         config: ConfigService,
         primaryLlm: LlmPort,
         circuitBreaker: CircuitBreaker,
+        shadowTaskRepo: ShadowTaskRepository,
+        mismatchRepo: MismatchRepository,
+        contentMaxChars: int = 2000,
     ) -> None:
         self._queue = queue
         self._storage = storage
@@ -56,18 +67,32 @@ class ProxyService:
         self._config = config
         self._primaryLlm = primaryLlm
         self._breaker = circuitBreaker
+        self._shadowTaskRepo = shadowTaskRepo
+        self._mismatchRepo = mismatchRepo
+        self._contentMaxChars = contentMaxChars
 
     async def proxyChat(self, requestPayload: dict[str, Any]) -> dict[str, Any]:
         # Shadow sampling — single Redis GET (~0.5 ms), TTL-cached in process.
         shadowPct = await self._config.getShadowPercentage()
         doShadow = random.random() * 100 < shadowPct
 
-        # One taskId ties the shadow event and the S3 archive together.
         taskId = str(uuid4())
-
         messages = requestPayload.get("messages", [])
         # Forward extra params (temperature, max_tokens, top_p, …) verbatim.
         extra = {k: v for k, v in requestPayload.items() if k != "messages"}
+
+        # Publish to queue BEFORE awaiting the primary call so the worker can
+        # start the candidate LLM call while we are still waiting for primary.
+        if doShadow:
+            safeTask(
+                self._queue.publish(
+                    SHADOW_TASKS_TOPIC,
+                    {"taskId": taskId, "taskType": TaskType.GENERIC.value, "messages": messages},
+                ),
+                name=f"shadow-publish-{taskId}",
+                timeoutSeconds=_PUBLISH_TIMEOUT_S,
+                onError=lambda _: self._metrics.recordBackgroundError(),
+            )
 
         start = time.monotonic()
         # Circuit breaker wraps the LLM call; raises CircuitOpenError when OPEN.
@@ -81,16 +106,8 @@ class ProxyService:
         # ── Return to client here. All tasks below are fire-and-forget. ──────
         safeTask(self._metrics.incrementRequests(), name="metrics-increment")
 
-        if doShadow:
-            safeTask(
-                self._publishShadow(taskId, messages, primaryResponse, latencyMs),
-                name=f"shadow-publish-{taskId}",
-                timeoutSeconds=_PUBLISH_TIMEOUT_S,
-                onError=lambda _: self._metrics.recordBackgroundError(),
-            )
-
         safeTask(
-            self._archive(taskId, messages, primaryResponse, latencyMs),
+            self._archivePrimaryAndMaybeCompare(taskId, messages, primaryResponse, latencyMs, doShadow),
             name=f"archive-{taskId}",
             timeoutSeconds=_ARCHIVE_TIMEOUT_S,
             onError=lambda _: self._metrics.recordBackgroundError(),
@@ -98,47 +115,50 @@ class ProxyService:
 
         return primaryResponse
 
-    async def _publishShadow(
+    async def _archivePrimaryAndMaybeCompare(
         self,
         taskId: str,
         messages: list[dict[str, Any]],
         primaryResponse: dict[str, Any],
         latencyMs: int,
+        doShadow: bool,
     ) -> None:
-        primaryContent = _getContent(primaryResponse)
+        now = datetime.now(timezone.utc)
+        primaryContent = _getContent(primaryResponse)[:self._contentMaxChars]
         primaryAction = _parseAction(primaryContent)
 
-        payload = {
-            "taskId": taskId,
-            "taskType": TaskType.GENERIC.value,
-            "messages": messages,
-            "primaryResponse": {
+        # Archive full primary response to blob storage (always, regardless of shadow).
+        primaryS3Path = f"tasks/GENERIC/{now.strftime('%Y/%m/%d')}/{taskId}/primary.json"
+        await self._storage.put(
+            primaryS3Path,
+            json.dumps({
                 "model": self._primaryLlm.modelId,
                 "decision": primaryAction.decision,
                 "rawContent": primaryContent,
                 "latencyMs": latencyMs,
-            },
-            "publishedAt": datetime.now(timezone.utc).isoformat(),
-        }
-        await self._queue.publish(SHADOW_TASKS_TOPIC, payload)
-
-    async def _archive(
-        self,
-        taskId: str,
-        messages: list[dict[str, Any]],
-        primaryResponse: dict[str, Any],
-        latencyMs: int,
-    ) -> None:
-        now = datetime.now(timezone.utc)
-        path = f"tasks/GENERIC/{now.strftime('%Y/%m/%d')}/{taskId}.json"
-        data = json.dumps(
-            {
-                "taskId": taskId,
-                "taskType": "GENERIC",
                 "messages": messages,
-                "primaryContent": _getContent(primaryResponse),
-                "latencyMs": latencyMs,
                 "timestamp": now.isoformat(),
-            }
-        ).encode()
-        await self._storage.put(path, data)
+            }).encode(),
+        )
+
+        if not doShadow:
+            return
+
+        # Write primary result into the shadow_tasks checkpoint row.
+        await self._shadowTaskRepo.upsertPrimaryDone(
+            taskId=taskId,
+            taskType=TaskType.GENERIC,
+            primaryS3Path=primaryS3Path,
+            primaryModel=self._primaryLlm.modelId,
+            primaryAction=primaryAction.decision,
+            primaryContent=primaryContent,
+            primaryLatencyMs=latencyMs,
+        )
+
+        # Atomic claim: returns True only if candidate is already done and no
+        # one else has claimed yet. This side wins the comparison race.
+        claimed = await self._shadowTaskRepo.tryClaimComparison(taskId)
+        if claimed:
+            task = await self._shadowTaskRepo.getTask(taskId)
+            if task:
+                await runComparison(task, self._mismatchRepo, self._shadowTaskRepo, self._metrics)

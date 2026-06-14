@@ -115,6 +115,33 @@ CHAT_PAYLOAD: dict = {"messages": [{"role": "user", "content": "hello"}]}
 
 
 # ---------------------------------------------------------------------------
+# Single shared event loop for the whole session.
+#
+# The container + shadow worker are session-scoped, but background DB tasks
+# (archive-*, shadow-eval-*) are spawned inside whichever loop is running when
+# a test publishes to the queue. With the default function-scoped loop, those
+# tasks are abandoned when the test's loop closes — often mid-transaction,
+# leaving the SQLite write lock held by a dead connection thread. The next
+# test's drain runs in a *new* loop and cannot even see them, so it hits
+# "database is locked". Pinning one loop for the session keeps every task in
+# the same loop so resetAdapters can reliably drain them between tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def event_loop():
+    # NOTE: Overriding event_loop is deprecated in pytest-asyncio, but in
+    # 0.23.x it is the only mechanism that makes the session-scoped container/
+    # worker fixtures and the function-scoped tests share ONE loop. The marker
+    # `scope="session"` alone does not pull the autouse session fixtures onto
+    # the same loop, so background DB tasks still leak across loops. Revisit if
+    # we upgrade to pytest-asyncio >= 0.24 (asyncio_default_test_loop_scope).
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+# ---------------------------------------------------------------------------
 # Session-scoped: build the Container and shadow worker once for the whole
 # test run, then mount them on app.state so every test can access them.
 # The main.py lifespan is guarded to skip init when the container is pre-set.
@@ -133,6 +160,8 @@ async def _initTestContainer():
     worker = ShadowWorker(
         queue=container.queue,
         mismatchRepo=container.mismatchRepository,
+        shadowTaskRepo=container.shadowTaskRepository,
+        storage=container.storage,
         metrics=MetricsService(cache=container.cache),
         candidateLlm=container.candidateLlm,
         maxConcurrent=settings.MAX_CONCURRENT_SHADOWS,
@@ -160,8 +189,26 @@ async def _initTestContainer():
 
 @pytest.fixture(autouse=True)
 async def resetAdapters(_initTestContainer) -> None:
+    # Drain background tasks from the previous test before touching shared
+    # state. Without this, archive-* tasks may still hold a SQLite write lock
+    # when reset() tries to DELETE, causing "database is locked".
+    # Multi-pass drain: each pass may create new tasks (queue dispatch creates
+    # shadow-eval, which creates comparison tasks). Repeat until stable.
+    _BG_PREFIXES = ("archive-", "shadow-publish-", "metrics-", "shadow-eval-", "queue-dispatch-")
+    for _ in range(6):
+        pending = {
+            t for t in asyncio.all_tasks()
+            if not t.done()
+            and t is not asyncio.current_task()
+            and any(t.get_name().startswith(p) for p in _BG_PREFIXES)
+        }
+        if not pending:
+            break
+        await asyncio.wait(pending, timeout=2.0)
+
     await app.state.container.cache.reset()
     await app.state.container.mismatchRepository.reset()
+    await app.state.container.shadowTaskRepository.reset()
     app.state.shadow_worker.pool._active = 0
     # Reset per-process caches so test isolation is guaranteed.
     ConfigService.clearCache()

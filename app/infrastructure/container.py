@@ -7,6 +7,7 @@ from app.ports.cache import CachePort
 from app.ports.database import MismatchRepository, ModelFleetRepository
 from app.ports.llm import LlmPort
 from app.ports.messageQueue import MessageQueuePort
+from app.ports.shadowTask import ShadowTaskRepository
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,14 @@ class Container:
     @property
     def modelFleetRepository(self) -> ModelFleetRepository:
         return self._ensureDb()
+
+    @property
+    def shadowTaskRepository(self) -> ShadowTaskRepository:
+        return self._ensureDb()
+
+    @property
+    def contentMaxChars(self) -> int:
+        return self._settings.CONTENT_MAX_CHARS
 
     @property
     def storage(self) -> BlobStoragePort:

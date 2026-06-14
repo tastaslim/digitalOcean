@@ -7,6 +7,7 @@ from app.ports.cache import CachePort
 from app.ports.database import MismatchRepository, ModelFleetRepository
 from app.ports.llm import LlmPort
 from app.ports.messageQueue import MessageQueuePort
+from app.ports.shadowTask import ShadowTaskRepository
 from app.resources.config.configService import ConfigService
 from app.resources.metrics.metricsService import MetricsService
 
@@ -39,8 +40,16 @@ def getModelFleetRepository(request: Request) -> ModelFleetRepository:
     return request.app.state.container.modelFleetRepository
 
 
+def getShadowTaskRepository(request: Request) -> ShadowTaskRepository:
+    return request.app.state.container.shadowTaskRepository
+
+
 def getStorage(request: Request) -> BlobStoragePort:
     return request.app.state.container.storage
+
+
+def getContentMaxChars(request: Request) -> int:
+    return request.app.state.container.contentMaxChars
 
 
 # ------------------------------------------------------------------

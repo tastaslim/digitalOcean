@@ -35,7 +35,7 @@ class ShadowPool:
         """
         return self._active
 
-    async def submit(self, coro: Coroutine[Any, Any, None]) -> bool:
+    async def submit(self, coro: Coroutine[Any, Any, None], name: str | None = None) -> bool:
         """
         Accept or reject a shadow coroutine based on current pool capacity.
 
@@ -62,5 +62,5 @@ class ShadowPool:
                 async with self._lock:
                     self._active -= 1
 
-        asyncio.create_task(_wrap())
+        asyncio.create_task(_wrap(), name=name or "shadow-eval")
         return True
