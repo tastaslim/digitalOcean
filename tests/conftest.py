@@ -3,7 +3,10 @@ import os
 import tempfile
 from pathlib import Path
 
-_tmpDb = tempfile.mktemp(suffix="_test_mismatches.db")
+# mkstemp creates the file and returns an open fd + path. Close the fd
+# immediately; SQLite (aiosqlite) opens its own connection to the path.
+_tmpDbFd, _tmpDb = tempfile.mkstemp(suffix="_test_mismatches.db")
+os.close(_tmpDbFd)
 
 import pytest
 

@@ -115,6 +115,12 @@ class Container:
                     await adapter.close()
                 except Exception:
                     logger.exception("Error closing adapter %s", type(adapter).__name__)
+        for llm in (self._primaryLlm, self._candidateLlm):
+            if llm is not None:
+                try:
+                    await llm.close()
+                except Exception:
+                    logger.exception("Error closing LLM adapter %s", type(llm).__name__)
         if self._db is not None and hasattr(self._db, "close"):
             try:
                 await self._db.close()

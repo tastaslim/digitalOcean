@@ -29,6 +29,10 @@ class MetricsService:
     async def recordShed(self) -> None:
         await self._cache.hincrby(_METRICS_HASH, "shedCount")
 
+    async def recordBackgroundError(self) -> None:
+        """Increment counter for failed fire-and-forget tasks (archive, shadow publish)."""
+        await self._cache.hincrby(_METRICS_HASH, "bgErrors")
+
     async def snapshot(self) -> dict[str, int | float]:
         raw = await self._cache.hgetall(_METRICS_HASH)
         total = int(raw.get("totalRequests", 0))
@@ -36,6 +40,7 @@ class MetricsService:
         exact_matches = int(raw.get("exactMatches", 0))
         shadow_errors = int(raw.get("shadowErrors", 0))
         shed_count = int(raw.get("shedCount", 0))
+        bg_errors = int(raw.get("bgErrors", 0))
         match_rate = (
             round(exact_matches / shadow_completed * 100, 2)
             if shadow_completed > 0
@@ -47,4 +52,5 @@ class MetricsService:
             "shadowCompleted": shadow_completed,
             "exactMatchRatePct": match_rate,
             "shedCount": shed_count,
+            "bgErrors": bg_errors,
         }

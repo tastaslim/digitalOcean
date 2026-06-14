@@ -25,11 +25,20 @@ class LlmPort(ABC):
         """Hard deadline for a single chat call (used by callers for wait_for)."""
 
     @abstractmethod
-    async def chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def chat(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
         """
         Send a chat completion request and return the raw provider JSON response.
 
-        :raises httpx.HTTPStatusError: Non-2xx from the provider.
-        :raises httpx.RequestError:    Transport-level failure.
-        :raises asyncio.TimeoutError:  Caller-supplied wait_for deadline exceeded.
+        Extra keyword arguments (temperature, max_tokens, top_p, …) are forwarded
+        to the provider verbatim, enabling full proxy fidelity without leaking
+        provider-specific concerns into the port contract.
+
+        :raises httpx.HTTPStatusError:   Non-2xx from the provider (after retries).
+        :raises httpx.TimeoutException:  Provider did not respond within timeoutSeconds.
+        :raises httpx.RequestError:      Transport-level failure (DNS, refused, …).
+        :raises asyncio.TimeoutError:    Outer wait_for deadline exceeded.
         """
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Release underlying HTTP connection pool. Called by Container.close()."""

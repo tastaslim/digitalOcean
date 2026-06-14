@@ -29,7 +29,7 @@ async def test_metrics_response_has_api_response_envelope(client: httpx.AsyncCli
 async def test_metrics_keys_are_camel_case(client: httpx.AsyncClient) -> None:
     resp = await client.get("/metrics")
     data = resp.json()["data"]
-    expected = {"totalRequests", "shadowErrors", "shadowCompleted", "exactMatchRatePct", "shedCount"}
+    expected = {"totalRequests", "shadowErrors", "shadowCompleted", "exactMatchRatePct", "shedCount", "bgErrors"}
     assert set(data.keys()) == expected
 
 

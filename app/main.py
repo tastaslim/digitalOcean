@@ -65,6 +65,23 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         except asyncio.CancelledError:
             pass
 
+    # Drain in-flight background tasks (archive, shadow-publish, metrics) before
+    # closing adapters. Without this, a rolling deploy drops tasks that were
+    # scheduled by the last request handled by the dying pod.
+    _BG_PREFIXES = ("shadow-publish-", "archive-", "metrics-")
+    pending = {
+        t for t in asyncio.all_tasks()
+        if not t.done()
+        and t is not asyncio.current_task()
+        and any(t.get_name().startswith(p) for p in _BG_PREFIXES)
+    }
+    if pending:
+        logger.info("Draining %d background task(s) before shutdown (15 s cap)…", len(pending))
+        _done, _still_pending = await asyncio.wait(pending, timeout=15)
+        for t in _still_pending:
+            logger.warning("Background task %r did not finish in time; cancelling", t.get_name())
+            t.cancel()
+
     if ownContainer:
         await _app.state.container.close()
 

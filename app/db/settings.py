@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from functools import lru_cache
@@ -5,12 +6,30 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+_settingsLog = logging.getLogger(__name__)
+
+
 def _expandRef(val: str) -> str:
     """Expand ${VAR_NAME} references using os.environ (same as shell interpolation).
+
     Pydantic-settings loads .env files verbatim and does not expand ${} references,
-    so we handle it here for the two API key helpers."""
+    so we handle it here for the two API key helpers.
+
+    Logs CRITICAL when a reference cannot be resolved — every subsequent LLM call
+    will fail with 401, so the operator must know immediately.
+    """
     m = re.match(r"^\$\{(\w+)\}$", val.strip())
-    return os.environ.get(m.group(1), val) if m else val
+    if not m:
+        return val
+    resolved = os.environ.get(m.group(1))
+    if resolved is None:
+        _settingsLog.critical(
+            "API key reference '%s' is not set in the environment — "
+            "all LLM calls will fail with 401 until this is fixed.",
+            val,
+        )
+        return val   # return the literal so startup still completes
+    return resolved
 
 
 class Settings(BaseSettings):

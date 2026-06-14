@@ -66,7 +66,10 @@ async def chat(
         return await proxySvc.proxyChat(payload)
     except CircuitOpenError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        # asyncio.TimeoutError  — outer wait_for deadline exceeded
+        # httpx.TimeoutException — httpx read/connect/pool timeout (subclass of
+        #   httpx.RequestError, so must be caught BEFORE the 502 handler below)
         raise HTTPException(
             status_code=504,
             detail="Primary LLM did not respond within the configured timeout.",

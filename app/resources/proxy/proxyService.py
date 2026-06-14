@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 SHADOW_TASKS_TOPIC = "shadow.tasks"
 
+# Hard deadlines for fire-and-forget background tasks.
+# Prevents stalled S3/SQS from accumulating tasks in the event loop indefinitely.
+_PUBLISH_TIMEOUT_S = 10.0
+_ARCHIVE_TIMEOUT_S = 30.0
+
 
 class ProxyService:
     """
@@ -31,6 +36,9 @@ class ProxyService:
 
     The primary LLM provider is injected as a LlmPort. Swap providers (OpenAI →
     Groq → DigitalOcean inference → …) by changing cloud.env — no code changes.
+
+    Extra request params (temperature, max_tokens, top_p, …) are extracted from
+    the request payload and forwarded to the primary LLM for full proxy fidelity.
     """
 
     def __init__(
@@ -58,12 +66,14 @@ class ProxyService:
         taskId = str(uuid4())
 
         messages = requestPayload.get("messages", [])
+        # Forward extra params (temperature, max_tokens, top_p, …) verbatim.
+        extra = {k: v for k, v in requestPayload.items() if k != "messages"}
 
         start = time.monotonic()
         # Circuit breaker wraps the LLM call; raises CircuitOpenError when OPEN.
         # wait_for provides a hard outer deadline matching the adapter's timeout.
         primaryResponse = await asyncio.wait_for(
-            self._breaker.call(self._primaryLlm.chat(messages)),
+            self._breaker.call(self._primaryLlm.chat(messages, **extra)),
             timeout=self._primaryLlm.timeoutSeconds,
         )
         latencyMs = int((time.monotonic() - start) * 1000)
@@ -75,11 +85,15 @@ class ProxyService:
             safeTask(
                 self._publishShadow(taskId, messages, primaryResponse, latencyMs),
                 name=f"shadow-publish-{taskId}",
+                timeoutSeconds=_PUBLISH_TIMEOUT_S,
+                onError=lambda _: self._metrics.recordBackgroundError(),
             )
 
         safeTask(
             self._archive(taskId, messages, primaryResponse, latencyMs),
             name=f"archive-{taskId}",
+            timeoutSeconds=_ARCHIVE_TIMEOUT_S,
+            onError=lambda _: self._metrics.recordBackgroundError(),
         )
 
         return primaryResponse
@@ -106,10 +120,7 @@ class ProxyService:
             },
             "publishedAt": datetime.now(timezone.utc).isoformat(),
         }
-        try:
-            await self._queue.publish(SHADOW_TASKS_TOPIC, payload)
-        except Exception:
-            logger.warning("Failed to publish shadow event for task %s", taskId)
+        await self._queue.publish(SHADOW_TASKS_TOPIC, payload)
 
     async def _archive(
         self,
@@ -130,7 +141,4 @@ class ProxyService:
                 "timestamp": now.isoformat(),
             }
         ).encode()
-        try:
-            await self._storage.put(path, data)
-        except Exception:
-            logger.warning("Failed to archive task %s to blob storage", taskId)
+        await self._storage.put(path, data)
