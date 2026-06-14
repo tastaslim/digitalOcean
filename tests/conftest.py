@@ -1,20 +1,54 @@
 import asyncio
 import os
+import tempfile
 from pathlib import Path
+
+_tmpDb = tempfile.mktemp(suffix="_test_mismatches.db")
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Load cloud.env.example before any app module is imported.
-# Sets QUEUE_BACKEND=memory, CACHE_BACKEND=memory, DB_BACKEND=sqlite,
-# STORAGE_BACKEND=local so tests never touch external services.
+# Bootstrap environment before any app module is imported.
+#
+# Priority (highest → lowest):
+#   1. Variables already set in the process (CI secrets, docker-compose env)
+#   2. cloud.env (local dev — gitignored, contains real keys)
+#   3. Inline test-safe defaults below (CI fallback)
+#
+# All LLM calls are mocked in tests so API keys can be placeholders.
 # ---------------------------------------------------------------------------
-_exampleEnv = Path(__file__).parent.parent / "cloud.env"
-for _line in _exampleEnv.read_text().splitlines():
-    _line = _line.strip()
-    if _line and not _line.startswith("#") and "=" in _line:
-        _key, _, _val = _line.partition("=")
-        os.environ.setdefault(_key.strip(), _val.strip())
+_cloudEnv = Path(__file__).parent.parent / "cloud.env"
+if _cloudEnv.exists():
+    for _line in _cloudEnv.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _val = _line.partition("=")
+            os.environ.setdefault(_key.strip(), _val.strip())
+
+# Defaults that must always be set — safe for CI (no real services).
+_TEST_DEFAULTS: dict[str, str] = {
+    "QUEUE_BACKEND": "memory",
+    "CACHE_BACKEND": "memory",
+    "DB_BACKEND": "sqlite",
+    "STORAGE_BACKEND": "local",
+    "MISMATCH_DB_PATH": _tmpDb,
+    "LOCAL_STORAGE_DIR": "/tmp/.shadow_storage_test",
+    "PRIMARY_LLM_BASE_URL": "https://api.openai.com/v1",
+    "PRIMARY_LLM_MODEL": "gpt-4o-mini",
+    "PRIMARY_LLM_API_KEY": "test-key-primary",
+    "CANDIDATE_LLM_BASE_URL": "https://api.groq.com/openai/v1",
+    "CANDIDATE_LLM_MODEL": "llama-3.1-8b-instant",
+    "CANDIDATE_LLM_API_KEY": "test-key-candidate",
+    "SHADOW_TIMEOUT_SECONDS": "30",
+    "MAX_CONCURRENT_SHADOWS": "50",
+    "PRIMARY_LLM_TIMEOUT_SECONDS": "30",
+    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": "5",
+    "CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS": "30",
+    "CONTENT_MAX_CHARS": "2000",
+    "PROXY_API_KEY": "",
+}
+for _k, _v in _TEST_DEFAULTS.items():
+    os.environ.setdefault(_k, _v)
 
 from app.db.settings import getSettings  # noqa: E402
 from app.infrastructure.container import Container  # noqa: E402
