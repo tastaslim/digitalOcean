@@ -1,42 +1,36 @@
+import os
+import re
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _expandRef(val: str) -> str:
+    """Expand ${VAR_NAME} references using os.environ (same as shell interpolation).
+    Pydantic-settings loads .env files verbatim and does not expand ${} references,
+    so we handle it here for the two API key helpers."""
+    m = re.match(r"^\$\{(\w+)\}$", val.strip())
+    return os.environ.get(m.group(1), val) if m else val
 
 
 class Settings(BaseSettings):
     """
     Application settings loaded from ``cloud.env`` (and environment variables).
 
-    All fields map directly to environment variable names.  Per-endpoint API
-    keys fall back to the shared :attr:`API_KEY` when left blank.
+    Backend selection fields control which adapter the Container instantiates:
+    - ``QUEUE_BACKEND``:   memory | sqs
+    - ``CACHE_BACKEND``:   memory | redis
+    - ``DB_BACKEND``:      sqlite | postgres
+    - ``STORAGE_BACKEND``: local  | s3    | azure
 
-    :param API_KEY: Shared fallback bearer token used when a per-endpoint key
-        is not set.
-    :type API_KEY: str
-    :param PRIMARY_LLM_BASE_URL: Base URL of the primary LLM endpoint.
-    :type PRIMARY_LLM_BASE_URL: str
-    :param PRIMARY_LLM_API_KEY: Bearer token for the primary endpoint;
-        falls back to :attr:`API_KEY` when blank.
-    :type PRIMARY_LLM_API_KEY: str
-    :param PRIMARY_LLM_MODEL: Model identifier sent to the primary endpoint.
-    :type PRIMARY_LLM_MODEL: str
-    :param CANDIDATE_LLM_BASE_URL: Base URL of the candidate (shadow) LLM endpoint.
-    :type CANDIDATE_LLM_BASE_URL: str
-    :param CANDIDATE_LLM_API_KEY: Bearer token for the candidate endpoint;
-        falls back to :attr:`API_KEY` when blank.
-    :type CANDIDATE_LLM_API_KEY: str
-    :param CANDIDATE_LLM_MODEL: Model identifier sent to the candidate endpoint.
-    :type CANDIDATE_LLM_MODEL: str
-    :param SHADOW_TIMEOUT_SECONDS: Maximum seconds to wait for a candidate
-        response before recording a timeout error.
-    :type SHADOW_TIMEOUT_SECONDS: int
-    :param MAX_CONCURRENT_SHADOWS: Pool cap — shadow tasks beyond this limit are
-        dropped (load-shed) to protect the primary request path.
-    :type MAX_CONCURRENT_SHADOWS: int
-    :param MISMATCH_DB_PATH: Filesystem path for the SQLite mismatch database.
-    :type MISMATCH_DB_PATH: str
+    All per-endpoint API keys fall back to the shared ``API_KEY`` when left blank.
     """
 
     model_config = SettingsConfigDict(env_file="cloud.env", extra="ignore")
+
+    # ------------------------------------------------------------------
+    # LLM endpoints
+    # ------------------------------------------------------------------
 
     API_KEY: str = ""
 
@@ -50,36 +44,102 @@ class Settings(BaseSettings):
 
     SHADOW_TIMEOUT_SECONDS: int = 30
     MAX_CONCURRENT_SHADOWS: int = 50
+    PRIMARY_LLM_TIMEOUT_SECONDS: int = 30
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
+    # Clients must send X-API-Key: <value> on every request.
+    # Leave blank to disable auth (dev / local testing only).
+    PROXY_API_KEY: str = ""
+
+    # ------------------------------------------------------------------
+    # Circuit breaker — primary LLM
+    # ------------------------------------------------------------------
+
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECONDS: int = 30
+
+    # ------------------------------------------------------------------
+    # Content storage limits
+    # ------------------------------------------------------------------
+
+    # Mismatch DB rows store a preview of LLM responses; full text lives in S3.
+    # Raising this does not require a migration — TEXT columns have no length limit.
+    CONTENT_MAX_CHARS: int = 2000
+
+    # ------------------------------------------------------------------
+    # Backend selection — swap without touching application code
+    # ------------------------------------------------------------------
+
+    QUEUE_BACKEND: str = "memory"     # memory | sqs
+    CACHE_BACKEND: str = "memory"     # memory | redis
+    DB_BACKEND: str = "sqlite"        # sqlite | postgres
+    STORAGE_BACKEND: str = "local"    # local  | s3   | azure
+
+    # ------------------------------------------------------------------
+    # SQLite (DB_BACKEND=sqlite, default)
+    # ------------------------------------------------------------------
+
     MISMATCH_DB_PATH: str = "mismatches.db"
 
-    def primaryKey(self) -> str:
-        """
-        Return the effective API key for the primary LLM endpoint.
+    # ------------------------------------------------------------------
+    # Local storage (STORAGE_BACKEND=local, default)
+    # ------------------------------------------------------------------
 
-        :return: :attr:`PRIMARY_LLM_API_KEY` if set, otherwise :attr:`API_KEY`.
-        :rtype: str
-        """
-        return self.PRIMARY_LLM_API_KEY or self.API_KEY
+    LOCAL_STORAGE_DIR: str = ".shadow_storage"
+
+    # ------------------------------------------------------------------
+    # AWS — used by SQSAdapter and S3Adapter
+    # ------------------------------------------------------------------
+
+    AWS_REGION: str = "us-east-1"
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+
+    # SQS fan-out: all shadow events go to this SNS topic, which routes to
+    # per-model SQS queues via infrastructure-managed subscriptions.
+    SNS_SHADOW_TOPIC_ARN: str = ""
+
+    # Optional endpoint override — set to http://localstack:4566 when running
+    # LocalStack so boto3 targets the local emulator instead of real AWS.
+    AWS_ENDPOINT_URL: str = ""
+
+    # S3 archive for replay
+    S3_BUCKET: str = ""
+    S3_PREFIX: str = "shadow-events"
+
+    # ------------------------------------------------------------------
+    # Redis (CACHE_BACKEND=redis)
+    # ------------------------------------------------------------------
+
+    REDIS_URL: str = "redis://localhost:6379"
+
+    # ------------------------------------------------------------------
+    # PostgreSQL (DB_BACKEND=postgres)
+    # ------------------------------------------------------------------
+
+    DATABASE_URL: str = ""
+
+    # ------------------------------------------------------------------
+    # Azure Blob (STORAGE_BACKEND=azure)
+    # ------------------------------------------------------------------
+
+    AZURE_STORAGE_CONNECTION_STRING: str = ""
+    AZURE_CONTAINER_NAME: str = ""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def primaryKey(self) -> str:
+        return _expandRef(self.PRIMARY_LLM_API_KEY or self.API_KEY)
 
     def candidateKey(self) -> str:
-        """
-        Return the effective API key for the candidate LLM endpoint.
-
-        :return: :attr:`CANDIDATE_LLM_API_KEY` if set, otherwise :attr:`API_KEY`.
-        :rtype: str
-        """
-        return self.CANDIDATE_LLM_API_KEY or self.API_KEY
+        return _expandRef(self.CANDIDATE_LLM_API_KEY or self.API_KEY)
 
 
 @lru_cache
 def getSettings() -> Settings:
-    """
-    Return the cached :class:`Settings` instance loaded from ``cloud.env``.
-
-    The result is memoised by :func:`functools.lru_cache`, so settings are
-    read from disk exactly once per process.
-
-    :return: Application settings singleton.
-    :rtype: Settings
-    """
     return Settings()  # pyright: ignore[reportCallIssue]

@@ -1,4 +1,5 @@
 services:
+  # ── Application ───────────────────────────────────────────────────────────
   app:
     build:
       context: .
@@ -7,17 +8,48 @@ services:
     ports:
       - "8000:8000"
 
-    # Real credentials — never committed; copy cloud.env.example → cloud.env
+    # Base config (LLM keys, model names) comes from cloud.env.
+    # Everything below overrides cloud.env to wire the app to the
+    # containerised services defined in this file.
     env_file:
       - cloud.env
-
-    # Point the SQLite mismatch DB at the named volume mount
     environment:
+      # ── Persistent DB ─────────────────────────────────────────────────
+      DB_BACKEND: postgres
+      DATABASE_URL: postgresql://shadow:shadow@postgres:5432/shadow
+
+      # ── Distributed cache ─────────────────────────────────────────────
+      CACHE_BACKEND: redis
+      REDIS_URL: redis://redis:6379
+
+      # ── Blob storage (archives) via LocalStack S3 ─────────────────────
+      STORAGE_BACKEND: s3
+      S3_BUCKET: shadow-events
+      S3_PREFIX: shadow-events
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+
+      # ── Queue (in-process for single-node; switch to sqs for scale-out)
+      # For multi-process SQS deployment set:
+      #   QUEUE_BACKEND: sqs
+      #   SNS_SHADOW_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:shadow-events
+      QUEUE_BACKEND: memory
+
+      # ── SQLite path is irrelevant when DB_BACKEND=postgres, but set anyway
       MISMATCH_DB_PATH: /data/mismatches.db
 
-    # Persist mismatch rows across container restarts
     volumes:
-      - mismatch_data:/data
+      - app_data:/data
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
 
     restart: unless-stopped
 
@@ -26,15 +58,12 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
       interval: 30s
       timeout: 5s
       start_period: 15s
       retries: 3
 
-    # Cap memory to enforce the bounded-concurrency contract:
-    # MAX_CONCURRENT_SHADOWS tasks × ~10 MB each + base ≈ well within 512 MB.
-    # Raise if you increase MAX_CONCURRENT_SHADOWS significantly.
     deploy:
       resources:
         limits:
@@ -48,6 +77,72 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ── Redis (CACHE_BACKEND=redis) ───────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── PostgreSQL (DB_BACKEND=postgres) ─────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: shadow
+      POSTGRES_PASSWORD: shadow
+      POSTGRES_DB: shadow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shadow -d shadow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── LocalStack (STORAGE_BACKEND=s3 / optional QUEUE_BACKEND=sqs) ─────────
+  # Bootstrap script (scripts/localstack-init.sh) runs on startup and creates:
+  #   - SNS topic:  shadow-events
+  #   - SQS queue:  shadow-tasks  (subscribed to the topic)
+  #   - S3 bucket:  shadow-events
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,sns,s3
+      DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"s3\": \"running\"'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
 volumes:
-  mismatch_data:
+  app_data:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  localstack_data:
     driver: local

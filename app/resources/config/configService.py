@@ -1,37 +1,57 @@
-import asyncio
+import time
+
+from app.ports.cache import CachePort
+
+_CONFIG_HASH = "config:shadow"
+_SHADOW_PCT_FIELD = "shadowPercentage"
+_DEFAULT_SHADOW_PCT = 100.0
+_CACHE_TTL = 5.0  # seconds — shadow percentage is read on every request
 
 
-class RuntimeConfig:
+class ConfigService:
     """
-    Mutable runtime configuration updated live via ``PUT /config``.
+    Mutable runtime configuration backed by CachePort.
 
-    All mutations go through :meth:`update` which holds an ``asyncio.Lock``,
-    making writes safe under concurrent requests.
+    In production this is a Redis hash — a single PUT /config write propagates
+    to all API pods within milliseconds. In dev/tests this is InMemoryCacheAdapter.
+
+    getShadowPercentage() is called on every proxy request, so it uses a
+    class-level in-process TTL cache (5 s) to avoid a Redis round-trip on
+    every call at scale. The cache is invalidated immediately on update() so
+    the change is visible to the next request in the same process without
+    waiting for TTL expiry.
     """
 
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self.shadowPercentage: float = 100.0
+    # Class-level cache — shared across all ConfigService instances in one process.
+    # At scale, each pod has its own copy; Redis is the source of truth.
+    _pctCache: float | None = None
+    _pctCacheTs: float = 0.0
+
+    def __init__(self, cache: CachePort) -> None:
+        self._cache = cache
 
     async def update(self, shadowPercentage: float) -> None:
-        """
-        Replace the shadow routing percentage atomically.
+        await self._cache.hset(_CONFIG_HASH, _SHADOW_PCT_FIELD, str(shadowPercentage))
+        ConfigService._pctCache = None  # invalidate so next read is fresh
 
-        :param shadowPercentage: Proportion of requests (0–100) to mirror to
-            the candidate LLM.
-        :type shadowPercentage: float
-        """
-        async with self._lock:
-            self.shadowPercentage = shadowPercentage
+    async def getShadowPercentage(self) -> float:
+        now = time.monotonic()
+        if (
+            ConfigService._pctCache is not None
+            and now - ConfigService._pctCacheTs < _CACHE_TTL
+        ):
+            return ConfigService._pctCache
+        val = await self._cache.hget(_CONFIG_HASH, _SHADOW_PCT_FIELD)
+        result = float(val) if val is not None else _DEFAULT_SHADOW_PCT
+        ConfigService._pctCache = result
+        ConfigService._pctCacheTs = now
+        return result
 
-    def snapshot(self) -> dict[str, float]:
-        """
-        Return a point-in-time copy of the current runtime configuration.
+    async def snapshot(self) -> dict[str, float]:
+        return {"shadowPercentage": await self.getShadowPercentage()}
 
-        :return: Dict with key ``shadowPercentage`` reflecting the current value.
-        :rtype: dict[str, float]
-        """
-        return {"shadowPercentage": self.shadowPercentage}
-
-
-runtimeConfig = RuntimeConfig()
+    @classmethod
+    def clearCache(cls) -> None:
+        """Force-expire the in-process cache. Used in tests between runs."""
+        cls._pctCache = None
+        cls._pctCacheTs = 0.0

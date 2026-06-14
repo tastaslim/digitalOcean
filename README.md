@@ -1,448 +1,598 @@
 # LLM Shadow Proxy
 
-A production FastAPI service that routes customer traffic to a **primary** LLM while
-asynchronously shadowing every request to a **candidate** LLM in the background.
-Response quality is evaluated deterministically and exposed via a real-time metrics
-endpoint. Shadow concurrency is strictly bounded to protect the primary request path
-under load. Action-key mismatches are streamed to a local SQLite file for offline
-debugging.
+## What is this and why does it exist?
+
+Imagine your product uses a GPT-4 model to make decisions — like approving a loan, cancelling an order, or routing a support ticket. Your team wants to switch to a newer, cheaper model. But how do you know the new model gives the same answers? You can't just swap it in and hope for the best in production.
+
+**Shadow testing** solves this. Every real user request goes to your current (primary) model as usual — the user gets their response with zero added delay. At the same time, the same request is secretly sent to the new (candidate) model in the background. The two responses are compared. If they disagree, that's a **mismatch** — logged and stored for your team to review.
+
+This service is the infrastructure that makes that happen at scale (millions of requests/day).
 
 ---
 
-## Architecture
+## High-Level Design (HLD)
 
+```mermaid
+graph TD
+    Client(["👤 Client"])
+    Proxy["Proxy Service\n(control plane)\nPOST /v1/chat\nGET /metrics\nPUT /config"]
+    PrimaryLLM(["🧠 Primary LLM\n(GPT-4 / current model)"])
+    Queue[["📬 Message Queue\n(SQS in prod\nin-memory in dev)"]]
+    Worker["Shadow Worker Service\n(background consumer)"]
+    CandidateLLM(["🧠 Candidate LLM\n(new model under test)"])
+    Evaluator["Domain Evaluator\nGENERIC / JOB_CANCEL\nORDER_CANCEL"]
+    DB[("🗄️ Mismatch DB\n(PostgreSQL / SQLite)")]
+    Cache[("⚡ Cache\n(Redis / in-memory)\nMetrics + Config")]
+    Storage[("🪣 Blob Storage\n(S3 / local)\nRaw archives")]
+
+    Client -->|"POST /v1/chat"| Proxy
+    Proxy -->|"1 — await (blocking)"| PrimaryLLM
+    PrimaryLLM -->|"response"| Proxy
+    Proxy -->|"2 — return immediately"| Client
+    Proxy -.->|"3 — fire & forget\ncreate_task"| Queue
+    Proxy -.->|"4 — fire & forget\ncreate_task"| Storage
+    Proxy -.->|"5 — fire & forget\ncreate_task"| Cache
+    Queue -->|"dequeue"| Worker
+    Worker -->|"call candidate LLM"| CandidateLLM
+    CandidateLLM -->|"response"| Worker
+    Worker --> Evaluator
+    Evaluator -->|"mismatch"| DB
+    Evaluator -->|"metrics"| Cache
+
+    style Client fill:#4a90d9,color:#fff
+    style PrimaryLLM fill:#7b68ee,color:#fff
+    style CandidateLLM fill:#7b68ee,color:#fff
+    style Queue fill:#f0ad4e,color:#000
+    style Worker fill:#5cb85c,color:#fff
+    style Proxy fill:#5bc0de,color:#000
+    style Evaluator fill:#5cb85c,color:#fff
+    style DB fill:#d9534f,color:#fff
+    style Cache fill:#d9534f,color:#fff
+    style Storage fill:#d9534f,color:#fff
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          FastAPI  —  API Layer                            │
-│                                                                          │
-│        POST /v1/chat          GET /metrics          PUT /config           │
-└─────────────────┬────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────┐
-│           proxyService           │
-│                                 │
-│  ① increment totalRequests      │
-│  ② build primary payload        │
-│  ③ await Primary LLM  ──────────┼──────────────────────► Response to
-│  ④ sample shadowPercentage      │                         client (sync,
-│  ⑤ submit to ShadowPool        │                         immediate)
-└─────────────────┬───────────────┘
-                  │  asyncio.create_task  (non-blocking, returns immediately)
-                  ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Shadow Evaluation Pool                            │
-│                                                                         │
-│   Capacity gate  ──  _active >= MAX_CONCURRENT_SHADOWS?                 │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │  YES → close coroutine, recordShed()  (memory-safe load shed)  │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
-│                  │ NO                                                    │
-│                  ▼                                                       │
-│   Await Candidate LLM  (bounded by SHADOW_TIMEOUT_SECONDS)              │
-│                  │                                                       │
-│                  ▼                                                       │
-│   Extract `action` key from both responses (parsed JSON)                │
-│                  │                                                       │
-│       ┌──────────┴──────────────────────┐                               │
-│       │ both parseable JSON?            │                               │
-│       │                                 │                               │
-│      NO                                YES                              │
-│       │                    ┌────────────┴──────────┐                   │
-│       ▼                    │  actions equal?        │                   │
-│  recordShadowResult        │                        │                   │
-│  (exactMatch=False)       YES                      NO                  │
-│                             │                       │                   │
-│                             ▼                       ▼                   │
-│                    recordShadowResult      write to mismatches.db       │
-│                    (exactMatch=True)       recordShadowResult           │
-│                                           (exactMatch=False)            │
-└─────────────────────────────────────────────────────────────────────────┘
+
+> Solid arrows = **blocking** (user waits). Dashed arrows = **fire-and-forget** (user doesn't wait).
+
+---
+
+## Request Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Proxy as Proxy Service
+    participant PrimaryLLM as Primary LLM
+    participant Queue as SQS Queue
+    participant Worker as Shadow Worker
+    participant CandidateLLM as Candidate LLM
+    participant Evaluator as Domain Evaluator
+    participant DB as Mismatch DB
+    participant Cache as Redis Cache
+
+    Client->>Proxy: POST /v1/chat {messages}
+
+    Note over Proxy: getShadowPercentage() — Redis read ~0.5ms
+
+    Proxy->>PrimaryLLM: call primary model
+    PrimaryLLM-->>Proxy: primary response
+
+    Proxy-->>Client: 🟢 return response immediately
+    Note over Client,Proxy: Client is DONE. Everything below is background.
+
+    par fire-and-forget background tasks
+        Proxy-)Queue: publish {taskId, messages, primaryResponse}
+        Proxy-)Cache: increment totalRequests
+        Proxy-)DB: archive raw event to blob storage
+    end
+
+    Queue-)Worker: dequeue message
+
+    Note over Worker: ShadowPool.submit() — check if under MAX_CONCURRENT_SHADOWS cap
+    alt pool has capacity
+        Worker->>CandidateLLM: call candidate model (timeout-bounded)
+        CandidateLLM-->>Worker: candidate response
+
+        Worker->>Evaluator: evaluate(primaryResponse, candidateResponse)
+
+        alt responses match
+            Evaluator->>Cache: recordShadowResult(exactMatch=true)
+        else responses differ
+            Evaluator->>DB: save MismatchRecord
+            Evaluator->>Cache: recordShadowResult(exactMatch=false)
+        end
+    else pool full — traffic spike protection
+        Worker->>Cache: recordShed()
+        Note over Worker: coroutine dropped, no memory leak
+    end
 ```
 
 ---
 
-## Endpoints
+## Flow Diagram: what happens to every request
 
-| Method | Path        | Description                                              |
-|--------|-------------|----------------------------------------------------------|
-| `POST` | `/v1/chat`  | Proxy chat request to primary LLM; shadow to candidate  |
-| `GET`  | `/metrics`  | Real-time shadow evaluation counters                     |
-| `PUT`  | `/config`   | Hot-update shadow routing percentage                     |
+```mermaid
+flowchart TD
+    A([Request arrives]) --> B[Call PRIMARY LLM]
+    B --> C[Return response to client]
+    C --> D{Shadow\nsampling\ncheck}
 
----
+    D -->|random % < shadowPercentage| E[Publish to queue\nfire-and-forget]
+    D -->|not sampled| F([Done — no shadow])
 
-## Configuration (`cloud.env`)
+    E --> G[Archive to blob storage\nfire-and-forget]
+    G --> H([Client already got\ntheir response])
 
-```env
-# Shared DO inference token (fallback when per-endpoint keys are blank)
-API_KEY=doo_v1_...
+    E --> I[Worker dequeues message]
+    I --> J{ShadowPool\ncapacity?}
 
-PRIMARY_LLM_BASE_URL=https://inference.do-ai.run/v1
-PRIMARY_LLM_API_KEY=          # leave blank to use API_KEY
-PRIMARY_LLM_MODEL=openai-gpt-oss-120b
+    J -->|pool full| K[Drop + increment shedCount]
+    J -->|capacity available| L[Call CANDIDATE LLM]
 
-CANDIDATE_LLM_BASE_URL=https://inference.do-ai.run/v1
-CANDIDATE_LLM_API_KEY=        # leave blank to use API_KEY
-CANDIDATE_LLM_MODEL=openai-gpt-oss-120b
+    L --> M{Candidate\nreturned OK?}
+    M -->|timeout or error| N[increment shadowErrors]
+    M -->|success| O[Run domain evaluator]
 
-SHADOW_TIMEOUT_SECONDS=30     # max wait for candidate response
-MAX_CONCURRENT_SHADOWS=50     # pool cap — excess requests are shed
+    O --> P{Responses\nmatch?}
+    P -->|exact match| Q[increment exactMatches]
+    P -->|mismatch| R[Save MismatchRecord to DB]
+    R --> S[increment shadowCompleted]
+    Q --> S
+
+    style C fill:#2d8a4e,color:#fff
+    style H fill:#2d8a4e,color:#fff
+    style K fill:#c0392b,color:#fff
+    style N fill:#c0392b,color:#fff
+    style R fill:#e67e22,color:#fff
+    style Q fill:#2d8a4e,color:#fff
 ```
 
 ---
 
-## Setup
-
-```bash
-# 1. Clone and enter the repo
-git clone <repository-url>
-cd digitalOcean
-
-# 2. Create virtual environment
-python -m venv venv && source venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure credentials
-#    Edit cloud.env and set PRIMARY_LLM_API_KEY / CANDIDATE_LLM_API_KEY (or API_KEY)
-
-# 5. Start the server
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-Or with Docker:
-
-```bash
-docker compose up --build
+User sends a request
+        │
+        ▼
+┌───────────────────┐
+│   Shadow Proxy    │
+│                   │
+│ 1. Ask PRIMARY    │──────────────────► User gets this response immediately
+│    model (GPT-4)  │                    (user never waits for anything else)
+│                   │
+│ 2. In background: │
+│    publish to SQS │
+└───────────────────┘
+          │
+          │  (completely separate service — user is already done)
+          ▼
+┌───────────────────────┐
+│   Shadow Worker       │
+│                       │
+│ 3. Ask CANDIDATE      │
+│    model (new LLM)    │
+│                       │
+│ 4. Compare answers    │
+│    ✓ Same → log match │
+│    ✗ Diff → log alert │
+└───────────────────────┘
 ```
-
-Interactive docs: http://localhost:8000/docs
 
 ---
 
-## Step-by-step curl walkthrough — watching metrics evolve
+## The critical design rule: respond to the user first, do everything else later
 
-### Step 1 — Confirm zero state
+The proxy does **one** blocking thing: call the primary model and return the answer to the user. Everything else — publishing to the queue, saving to storage, incrementing counters — is scheduled as a background task after the response is already on its way.
 
-```bash
-curl -s http://localhost:8000/metrics | python3 -m json.tool
+This is non-negotiable at scale. If SQS has a 100ms hiccup and we waited for it before responding, every user at that moment would feel that 100ms. With background tasks, users feel nothing.
+
+```python
+# What the code actually does:
+primaryResponse = await callPrimaryLLM(...)   # user waits ONLY for this
+
+# These three lines do NOT block the user — they're background tasks
+asyncio.create_task(publishToQueue(...))       # fire and forget
+asyncio.create_task(archiveToS3(...))          # fire and forget
+asyncio.create_task(metrics.increment())       # fire and forget
+
+return primaryResponse                         # user already getting this
 ```
 
-```json
-{
-  "status": 200,
-  "data": {
-    "totalRequests": 0,
-    "shadowErrors": 0,
-    "shadowCompleted": 0,
-    "exactMatchRatePct": 0.0,
-    "shedCount": 0
-  }
+---
+
+## How the two services talk to each other
+
+They don't — directly. The **queue** (AWS SQS in production, in-memory in dev/tests) is the only connection.
+
+```
+Proxy Service                    Shadow Worker Service
+─────────────                    ─────────────────────
+Publishes a message:             Picks up that message:
+{                                calls candidate LLM,
+  taskId: "abc-123",             compares answers,
+  messages: [...],               saves mismatches to DB,
+  primaryResponse: {...}         updates metrics
 }
 ```
 
-### Step 2 — Send a chat request (primary + shadow both fire at 100%)
+This means:
+- The proxy doesn't know or care what the worker does
+- The worker can be on a completely different server
+- If the worker is down, users are unaffected — messages queue up and get processed when it comes back
+- You can run 1 proxy and 10 workers if evaluations are the bottleneck
+
+---
+
+## Project structure
+
+```
+app/
+├── core/
+│   ├── llmClient.py        # shared function to call any LLM endpoint
+│   ├── shadowWorker.py     # background service: dequeues, calls candidate, evaluates
+│   └── shadowPool.py       # limits how many evaluations run at once (safety valve)
+│
+├── domain/
+│   ├── models/             # data shapes: TaskRequest, TaskResponse, ActionResult, etc.
+│   └── evaluators/         # comparison logic per task type (generic, job, order)
+│
+├── ports/                  # interfaces (abstract classes) for external systems
+│   ├── messageQueue.py     # what a queue must be able to do
+│   ├── cache.py            # what a cache must be able to do
+│   ├── database.py         # what a database must be able to do
+│   └── blobStorage.py      # what blob storage must be able to do
+│
+├── adapters/               # concrete implementations of those interfaces
+│   ├── queue/
+│   │   ├── memory.py       # in-process queue (dev/tests — no AWS needed)
+│   │   └── sqs.py          # AWS SQS (production)
+│   ├── cache/
+│   │   ├── memory.py       # Python dict (dev/tests)
+│   │   └── redis.py        # Redis (production)
+│   ├── database/
+│   │   ├── sqlite.py       # SQLite file (dev/tests)
+│   │   └── postgres.py     # PostgreSQL (production)
+│   └── storage/
+│       ├── local.py        # local filesystem (dev/tests)
+│       ├── s3.py           # AWS S3 (production)
+│       └── azureBlob.py    # Azure Blob Storage
+│
+├── infrastructure/
+│   ├── container.py        # reads env vars, wires up the right adapters
+│   └── dependencies.py     # FastAPI dependency injection helpers
+│
+└── resources/
+    ├── proxy/              # POST /v1/chat — the main endpoint
+    ├── metrics/            # GET /metrics
+    └── config/             # PUT /config
+```
+
+### Why ports and adapters? (Hexagonal Architecture)
+
+This pattern solves a real problem: your tests shouldn't need a real Redis/SQS/PostgreSQL running to pass. And switching from SQLite to PostgreSQL in production shouldn't require changing business logic.
+
+A **port** is just a Python abstract class that says "anything that acts as a cache must have these methods: `get`, `set`, `hincrby`...". An **adapter** is the actual implementation for one specific technology.
+
+```
+Your code talks to the port (abstract)
+         │
+         ▼
+    CachePort                   ← your business logic only knows this
+    ├── InMemoryCacheAdapter    ← used in tests and local dev
+    └── RedisAdapter            ← used in production
+```
+
+Swap the backend with one line in `cloud.env`. Zero code changes.
+
+---
+
+## What gets stored where
+
+| Data | Where | Why |
+|------|-------|-----|
+| Request/response counters | Redis (or in-memory) | Needs to be fast (every request increments) and shared across multiple proxy instances |
+| Mismatch records | PostgreSQL (or SQLite) | Permanent storage; needs to be queryable (show me all ORDER_CANCELLATION mismatches with CRITICAL severity) |
+| Raw request archives | S3 (or local file) | Large blobs; cheap storage; used for offline replay and debugging |
+| Shadow percentage config | Redis (or in-memory) | Needs to update live without restart; read on every request |
+
+---
+
+## Evaluators — how we decide if answers match
+
+Different kinds of LLM tasks need different comparison logic. A generic "is the action field the same?" check isn't good enough for a cancellation decision where a $500 refund amount is involved.
+
+| Task Type | What gets compared | When it's CRITICAL |
+|---|---|---|
+| `GENERIC` | `action` field exact match | — |
+| `JOB_CANCELLATION` | decision, affected resources (>80% overlap required), rollback plan present | Primary says cancel-immediate, candidate says defer or reject |
+| `ORDER_CANCELLATION` | decision, refund amount (±$0.01 tolerance), reason code, restock flag | Primary says full-refund, candidate says reject |
+
+Add your own evaluator:
+```python
+EvaluatorRegistry.register(TaskType.MY_TASK, MyEvaluator())
+```
+
+---
+
+## Safety valve — what happens when traffic spikes
+
+`ShadowPool` (`app/core/shadowPool.py`) limits how many evaluations run at the same time (default: 50). If 200 shadow events arrive in a burst:
+
+```
+50  get processed normally
+150 get dropped silently   ← shedCount in /metrics goes up by 150
+```
+
+Dropped evaluations never reach the candidate LLM, so a traffic spike can't cause an OOM crash or cascade failure. The `shedCount` metric tells you when you're hitting the cap so you can tune `MAX_CONCURRENT_SHADOWS` in `cloud.env`.
+
+---
+
+## API endpoints
+
+### `POST /v1/chat` — the main proxy endpoint
+
+Send the same payload you'd send directly to an OpenAI-compatible LLM.
 
 ```bash
-curl -s -X POST http://localhost:8000/v1/chat \
+curl -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
-      {"role": "system", "content": "Always reply with JSON containing an action key."},
-      {"role": "user",   "content": "What should I do next?"}
-    ],
-    "max_tokens": 150
-  }' | python3 -m json.tool
+      {"role": "system", "content": "You are a trading assistant. Reply with JSON: {\"action\": \"buy|sell|hold\"}"},
+      {"role": "user", "content": "Tesla just beat earnings. What should I do?"}
+    ]
+  }'
 ```
 
-You receive the primary LLM response immediately. The shadow fires in the background.
+You get back the primary model's response immediately. The shadow evaluation happens in the background — you never wait for it.
 
-### Step 3 — Check metrics (wait ~2 s for shadow to complete)
+### `GET /metrics` — see how the two models compare
 
 ```bash
-sleep 2 && curl -s http://localhost:8000/metrics | python3 -m json.tool
+curl http://localhost:8000/metrics
 ```
 
 ```json
 {
   "data": {
-    "totalRequests": 1,
-    "shadowCompleted": 1,
-    "exactMatchRatePct": 100.0,
-    "shadowErrors": 0,
+    "totalRequests": 1000,
+    "shadowCompleted": 412,
+    "exactMatchRatePct": 94.17,
+    "shadowErrors": 3,
     "shedCount": 0
   }
 }
 ```
 
-### Step 4 — Throttle shadow traffic to 50%
+| Field | Meaning |
+|-------|---------|
+| `totalRequests` | Total calls to `/v1/chat` |
+| `shadowCompleted` | Evaluations that finished (primary vs candidate compared) |
+| `exactMatchRatePct` | % of comparisons where both models gave the same answer |
+| `shadowErrors` | Candidate LLM timed out or returned unparseable output |
+| `shedCount` | Evaluations dropped because the pool was full |
+
+### `PUT /config` — change shadow percentage live (no restart)
 
 ```bash
+# Shadow 100% of traffic (every request gets evaluated)
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"shadowPercentage": 100}'
+
+# Shadow only 10% (low-cost sampling in production)
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"shadowPercentage": 10}'
+
+# Turn off all shadowing
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"shadowPercentage": 0}'
+```
+
+---
+
+## Quick start
+
+### Option 1: Local dev — no Docker, no AWS (fastest)
+
+Everything runs in-memory. No Redis, no PostgreSQL, no SQS needed.
+
+```bash
+git clone <repository-url>
+cd digitalOcean
+
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# Open cloud.env and fill in your LLM API keys:
+#   PRIMARY_LLM_API_KEY=your-key-here
+#   CANDIDATE_LLM_API_KEY=your-key-here
+nano cloud.env
+
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Visit `http://localhost:8000/docs` for the interactive API explorer.
+
+### Option 2: Docker — all production-like services
+
+Spins up the app + Redis + PostgreSQL + LocalStack (which emulates SQS and S3 locally).
+
+```bash
+# Fill in API keys first
+nano cloud.env
+
+docker compose up --build
+```
+
+Docker Compose starts services in the right order:
+
+```
+Redis ──────────────────────────────────────────────────────► healthy
+PostgreSQL ─────────────────────────────────────────────────► healthy
+LocalStack (creates SNS topic, SQS queue, S3 bucket) ───────► healthy
+                                                               │
+                                                               ▼
+                                                           App starts
+```
+
+The startup order is enforced with health checks — the app will not start until all three dependencies report healthy.
+
+---
+
+## Configuration reference (`cloud.env`)
+
+```env
+# ── Which LLM to use ─────────────────────────────────────────────────
+# PRIMARY: the model your users actually talk to
+# CANDIDATE: the new model you want to test
+PRIMARY_LLM_BASE_URL=https://inference.do-ai.run/v1
+PRIMARY_LLM_API_KEY=your-api-key-here
+PRIMARY_LLM_MODEL=openai-gpt-oss-120b
+
+CANDIDATE_LLM_BASE_URL=https://inference.do-ai.run/v1
+CANDIDATE_LLM_API_KEY=your-api-key-here
+CANDIDATE_LLM_MODEL=openai-gpt-oss-120b
+
+# ── How many concurrent shadow evaluations to allow ──────────────────
+# If more than this arrive at once, extras are dropped (shedCount goes up)
+SHADOW_TIMEOUT_SECONDS=30
+MAX_CONCURRENT_SHADOWS=50
+
+# ── Backend selection ─────────────────────────────────────────────────
+# Change these to switch from dev to production backends.
+# No code changes needed — just change the value and restart.
+QUEUE_BACKEND=memory        # memory (dev/tests) | sqs (production)
+CACHE_BACKEND=memory        # memory (dev/tests) | redis (production)
+DB_BACKEND=sqlite           # sqlite (dev/tests) | postgres (production)
+STORAGE_BACKEND=local       # local (dev/tests)  | s3 | azure
+
+# ── SQLite — only used when DB_BACKEND=sqlite ─────────────────────────
+MISMATCH_DB_PATH=mismatches.db
+
+# ── Local file storage — only used when STORAGE_BACKEND=local ─────────
+LOCAL_STORAGE_DIR=.shadow_storage
+
+# ── AWS — only needed when QUEUE_BACKEND=sqs or STORAGE_BACKEND=s3 ────
+# Leave AWS_ENDPOINT_URL blank for real AWS.
+# Set to http://localhost:4566 when using LocalStack locally.
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_ENDPOINT_URL=
+SNS_SHADOW_TOPIC_ARN=
+S3_BUCKET=
+S3_PREFIX=shadow-events
+
+# ── Redis — only needed when CACHE_BACKEND=redis ──────────────────────
+REDIS_URL=redis://localhost:6379
+
+# ── PostgreSQL — only needed when DB_BACKEND=postgres ─────────────────
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+
+# ── Azure Blob Storage — only needed when STORAGE_BACKEND=azure ───────
+AZURE_STORAGE_CONNECTION_STRING=
+AZURE_CONTAINER_NAME=
+```
+
+---
+
+## Docker Compose services
+
+| Service | Image | What it does |
+|---------|-------|--------------|
+| `app` | local build | The shadow proxy |
+| `redis` | `redis:7-alpine` | Shared counters and live config. Used when `CACHE_BACKEND=redis` |
+| `postgres` | `postgres:16-alpine` | Mismatch records. Used when `DB_BACKEND=postgres`. Credentials: user/pass/db all `shadow` |
+| `localstack` | `localstack/localstack:3` | Runs SQS, SNS, S3 locally on your machine. `scripts/localstack-init.sh` creates all the required resources at startup |
+
+---
+
+## Running the tests
+
+```bash
+pip install -r requirements.txt
+
+pytest tests/ -v --tb=short           # all 59 tests
+pytest tests/unit/ -v                 # unit tests only (no HTTP calls)
+pytest tests/integration/ -v          # integration tests only (uses TestClient)
+```
+
+**No API keys or running services needed.** All LLM HTTP calls are mocked. The test suite uses SQLite and in-memory adapters throughout.
+
+### What each test file covers
+
+| File | Tests | What it verifies |
+|------|-------|-----------------|
+| `unit/test_metricsService.py` | 10 | Counters increment correctly, match rate is calculated right |
+| `unit/test_shadowPool.py` | 5 | Pool accepts up to capacity, drops beyond it, cleans up after crashes |
+| `unit/test_configService.py` | 5 | Shadow percentage updates, boundary values (0 and 100 are valid, 101 is not) |
+| `unit/test_extractAction.py` | 11 | LLM response parsing handles valid JSON, missing keys, invalid JSON, nested objects |
+| `integration/test_proxyRoute.py` | 14 | Full request flow: primary response returned, shadow fires, match/mismatch recorded, load shedding works |
+| `integration/test_metricsRoute.py` | 5 | `/metrics` endpoint returns correct counts |
+| `integration/test_configRoute.py` | 11 | `/config` validates input, shadow gating actually works at 0% and 100% |
+
+### How the mocks work (for the curious)
+
+The tests patch `_callLlm` at the module level where it's imported:
+
+```python
+# In the test:
+with patch("app.resources.proxy.proxyService._callLlm", return_value=PRIMARY_RESPONSE):
+    ...
+
+# In the shadow worker test — separate patch since it's a separate service:
+with patch("app.core.shadowWorker._callLlm", return_value=CANDIDATE_RESPONSE):
+    ...
+```
+
+This mirrors the real architecture: the proxy and the shadow worker each make their own independent LLM calls.
+
+---
+
+## End-to-end walkthrough
+
+```bash
+# 1. Start the service
+uvicorn app.main:app --port 8000
+
+# 2. Set shadow to 100% so every request gets evaluated
 curl -s -X PUT http://localhost:8000/config \
   -H "Content-Type: application/json" \
-  -d '{"shadowPercentage": 50}' | python3 -m json.tool
-```
+  -d '{"shadowPercentage": 100}'
 
-```json
-{
-  "status": 200,
-  "data": {"shadowPercentage": 50.0},
-  "message": "Config updated"
-}
-```
-
-### Step 5 — Send several requests and observe partial shadowing
-
-```bash
-for i in {1..6}; do
-  curl -s -X POST http://localhost:8000/v1/chat \
-    -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"hello"}]}' > /dev/null
-done
-sleep 3 && curl -s http://localhost:8000/metrics | python3 -m json.tool
-```
-
-`shadowCompleted` will be roughly 3 out of 6 (50% sampling is probabilistic).
-
-### Step 6 — Disable all shadowing
-
-```bash
-curl -s -X PUT http://localhost:8000/config \
+# 3. Send a chat request
+curl -s -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"shadowPercentage": 0}' | python3 -m json.tool
-```
+  -d '{"messages": [{"role": "user", "content": "Should I buy or sell?"}]}' \
+  | python3 -m json.tool
+# → Primary model response arrives immediately
 
-Subsequent `/v1/chat` calls now return instantly with zero shadow overhead.
+# 4. Wait 2 seconds for the background evaluation to finish, then check metrics
+sleep 2
+curl -s http://localhost:8000/metrics | python3 -m json.tool
+# → shadowCompleted: 1, exactMatchRatePct: 100.0 (if models agreed)
 
-### Step 7 — Inspect and verify the SQLite mismatch store
-
-**Read all rows (Python — no sqlite3 CLI required):**
-
-```bash
+# 5. If using SQLite, inspect mismatch records directly
 python3 -c "
 import sqlite3
 conn = sqlite3.connect('mismatches.db')
-c = conn.cursor()
-c.execute('SELECT id, timestamp, primaryAction, candidateAction, primaryContent, candidateContent FROM mismatches ORDER BY id')
-rows = c.fetchall()
-print(f'--- {len(rows)} rows in mismatches table ---')
+rows = conn.execute('SELECT timestamp, primary_action, candidate_action, severity FROM mismatches').fetchall()
 for r in rows:
-    print(f'[{r[0]}] {r[1]}')
-    print(f'    primaryAction  : {r[2]}')
-    print(f'    candidateAction: {r[3]}')
-    print(f'    primaryContent : {r[4]}')
-    print(f'    candidateContent: {r[5]}')
-    print()
+    print(f'{r[0]}  primary={r[1]}  candidate={r[2]}  severity={r[3]}')
 conn.close()
 "
 ```
 
-Expected output after a mismatch has been recorded:
-
-```
---- 1 rows in mismatches table ---
-[1] 2026-06-08T06:24:01.457619+00:00
-    primaryAction  : buy
-    candidateAction: sell
-    primaryContent : {"action": "buy", "reason": "momentum positive"}
-    candidateContent: {"action": "sell", "reason": "risk too high"}
-```
-
-**Seed a mismatch row directly (simulate what the shadow evaluator writes):**
-
-```bash
-python3 -c "
-import asyncio, aiosqlite
-from datetime import datetime, timezone
-
-async def insert():
-    ts = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect('mismatches.db') as db:
-        await db.execute(
-            'INSERT INTO mismatches '
-            '(timestamp, primaryAction, candidateAction, primaryContent, candidateContent) '
-            'VALUES (?, ?, ?, ?, ?)',
-            (ts, 'approve', 'deny',
-             '{\"action\": \"approve\", \"confidence\": 0.9}',
-             '{\"action\": \"deny\", \"confidence\": 0.3}')
-        )
-        await db.commit()
-        async with db.execute('SELECT COUNT(*) FROM mismatches') as cur:
-            print('Total rows now:', (await cur.fetchone())[0])
-
-asyncio.run(insert())
-"
-```
-
-Re-run the read snippet above to confirm the row is present. This is useful for:
-
-- Verifying the schema is intact after a restart.
-- Checking that `recordMismatch()` in `app/core/database.py` produces the expected
-  column layout before running against live models.
-- Seeding rows to test any downstream tooling that consumes `mismatches.db`.
-
 ---
 
-## Evaluation heuristics
+## CI
 
-For every completed shadow call the service applies two deterministic rules in order:
+The GitHub Actions pipeline runs on every push:
 
-1. **Valid JSON** — `choices[0].message.content` from both models must parse as JSON.
-   If either fails, the shadow is recorded as completed but not as a match.
-2. **Exact action match** — the `action` key extracted from both JSON payloads must
-   be string-equal. Partial or fuzzy matching is intentionally excluded.
+1. Checkout code
+2. Install Python 3.13 + dependencies
+3. Run all 59 tests
 
-Mismatches where both responses are valid JSON but actions differ are written to
-`mismatches.db` asynchronously for offline inspection.
-
----
-
-## Bounding memory footprint under load
-
-Shadow tasks are managed by `ShadowPool` (`app/core/shadowPool.py`), a thin wrapper
-around an atomic counter and `asyncio.Lock`.
-
-```
-MAX_CONCURRENT_SHADOWS (default 50)
-        │
-        ▼
-  _active < max ──► accept task, increment _active, create_task(_wrap)
-  _active >= max ──► close coroutine immediately, recordShed(), return
-```
-
-**Why this prevents memory exhaustion:**
-
-- Each rejected coroutine is `.close()`d before being discarded — Python releases
-  its frame immediately, no `ResourceWarning`, no heap growth.
-- Accepted tasks decrement `_active` in a `finally` block, so a crashed task never
-  leaks a slot.
-- The queue depth is constant: `MAX_CONCURRENT_SHADOWS` tasks at most, each holding
-  one open `httpx.AsyncClient` connection and one response buffer. Memory usage is
-  `O(MAX_CONCURRENT_SHADOWS)` regardless of traffic volume.
-- `shedCount` in `/metrics` surfaces how often the cap was hit, giving operators
-  visibility to tune `MAX_CONCURRENT_SHADOWS` via `cloud.env` without a code change.
-
-To stress-test the cap locally:
-
-```bash
-# Set a very tight cap
-sed -i 's/MAX_CONCURRENT_SHADOWS=.*/MAX_CONCURRENT_SHADOWS=2/' cloud.env
-
-# Blast 20 concurrent requests
-for i in {1..20}; do
-  curl -s -X POST http://localhost:8000/v1/chat \
-    -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"ping"}]}' &
-done
-wait
-sleep 3 && curl -s http://localhost:8000/metrics | python3 -m json.tool
-# shedCount will show how many shadows were dropped to protect the primary path
-```
-
----
-
-## Running tests
-
-### Locally
-
-```bash
-# Install all dependencies (includes pytest and pytest-asyncio)
-pip install -r requirements.txt
-
-# Run the full suite
-pytest tests/ -v --tb=short
-
-# Run only unit tests
-pytest tests/unit/ -v
-
-# Run only integration tests
-pytest tests/integration/ -v
-
-# Run a single file
-pytest tests/unit/test_shadowPool.py -v
-```
-
-**Test coverage by file:**
-
-```
-tests/unit/test_metricsService.py      10 tests — counters, snapshot, rate calc
-tests/unit/test_shadowPool.py           5 tests — capacity, concurrency, slot teardown
-tests/unit/test_configService.py        5 tests — update, snapshot, boundary values
-tests/unit/test_extractAction.py       11 tests — JSON parsing, missing keys, edge cases
-tests/integration/test_proxyRoute.py   12 tests — success path, shadow match/mismatch,
-                                                   SQLite write, load shed, errors
-tests/integration/test_metricsRoute.py  5 tests — response envelope, camelCase keys,
-                                                   live counter reflection
-tests/integration/test_configRoute.py  11 tests — validation, boundary rejection,
-                                                   behavioural gating at 0% and 100%
-```
-
-> All LLM HTTP calls are mocked at the `_callLlm` level — no real API keys or
-> network access are required to run the test suite.
-
----
-
-## CI/CD
-
-The pipeline is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-and runs automatically on every push and pull request to any branch.
-
-### What the pipeline does
-
-```
-push / pull_request
-        │
-        ▼
-┌───────────────────────────────────────┐
-│  ubuntu-latest  ·  Python 3.13        │
-│                                       │
-│  1. actions/checkout@v4               │
-│  2. actions/setup-python@v5           │
-│     └─ pip cache keyed on             │
-│        requirements.txt hash          │
-│  3. pip install -r requirements.txt   │
-│  4. pytest tests/ -v --tb=short       │
-└───────────────────────────────────────┘
-```
-
-### Required env vars in CI
-
-No real secrets are needed. The four required settings fields are injected as plain
-env vars directly in the workflow — all LLM calls are mocked in the test suite so
-nothing ever reaches the network:
-
-```yaml
-env:
-  PRIMARY_LLM_BASE_URL: https://inference.do-ai.run/v1
-  PRIMARY_LLM_MODEL: openai-gpt-oss-120b
-  CANDIDATE_LLM_BASE_URL: https://inference.do-ai.run/v1
-  CANDIDATE_LLM_MODEL: openai-gpt-oss-120b
-```
-
-If you ever add tests that require a real API key, add it as a GitHub Actions secret
-and reference it in the workflow:
-
-```yaml
-env:
-  PRIMARY_LLM_API_KEY: ${{ secrets.DO_API_KEY }}
-```
-
-### Adding the secret in GitHub
-
-1. Go to **Settings → Secrets and variables → Actions** in your repository.
-2. Click **New repository secret**.
-3. Name: `DO_API_KEY`, value: your `doo_v1_...` token.
-4. Reference it in the workflow via `${{ secrets.DO_API_KEY }}`.
-
-### Checking pipeline status
-
-```bash
-# Using the GitHub CLI
-gh run list --limit 5
-gh run view          # latest run — shows per-step output
-gh run view --log    # full log output
-```
-
-Or open the **Actions** tab in your GitHub repository.
+No real API keys or external services needed in CI — all LLM calls are mocked.

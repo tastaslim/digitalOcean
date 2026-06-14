@@ -1,11 +1,12 @@
 import pytest
 
-from app.resources.metrics.metricsService import MetricsStore
+from app.adapters.cache.memory import InMemoryCacheAdapter
+from app.resources.metrics.metricsService import MetricsService
 
 
 @pytest.fixture
-def store() -> MetricsStore:
-    return MetricsStore()
+def store() -> MetricsService:
+    return MetricsService(cache=InMemoryCacheAdapter())
 
 
 # ---------------------------------------------------------------------------
@@ -13,15 +14,17 @@ def store() -> MetricsStore:
 # ---------------------------------------------------------------------------
 
 
-async def test_incrementRequests_once(store: MetricsStore) -> None:
+async def test_incrementRequests_once(store: MetricsService) -> None:
     await store.incrementRequests()
-    assert store.totalRequests == 1
+    snap = await store.snapshot()
+    assert snap["totalRequests"] == 1
 
 
-async def test_incrementRequests_multiple(store: MetricsStore) -> None:
+async def test_incrementRequests_multiple(store: MetricsService) -> None:
     for _ in range(5):
         await store.incrementRequests()
-    assert store.totalRequests == 5
+    snap = await store.snapshot()
+    assert snap["totalRequests"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -29,32 +32,36 @@ async def test_incrementRequests_multiple(store: MetricsStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_recordShadowResult_error_increments_shadowErrors(store: MetricsStore) -> None:
+async def test_recordShadowResult_error_increments_shadowErrors(store: MetricsService) -> None:
     await store.recordShadowResult(error=True)
-    assert store.shadowCompleted == 1
-    assert store.shadowErrors == 1
-    assert store.exactMatches == 0
+    snap = await store.snapshot()
+    assert snap["shadowCompleted"] == 1
+    assert snap["shadowErrors"] == 1
+    assert snap["exactMatchRatePct"] == 0.0
 
 
-async def test_recordShadowResult_exactMatch_increments_exactMatches(store: MetricsStore) -> None:
+async def test_recordShadowResult_exactMatch_increments_exactMatches(store: MetricsService) -> None:
     await store.recordShadowResult(error=False, exactMatch=True)
-    assert store.shadowCompleted == 1
-    assert store.exactMatches == 1
-    assert store.shadowErrors == 0
+    snap = await store.snapshot()
+    assert snap["shadowCompleted"] == 1
+    assert snap["exactMatchRatePct"] == 100.0
+    assert snap["shadowErrors"] == 0
 
 
-async def test_recordShadowResult_mismatch_only_increments_completed(store: MetricsStore) -> None:
+async def test_recordShadowResult_mismatch_only_increments_completed(store: MetricsService) -> None:
     await store.recordShadowResult(error=False, exactMatch=False)
-    assert store.shadowCompleted == 1
-    assert store.exactMatches == 0
-    assert store.shadowErrors == 0
+    snap = await store.snapshot()
+    assert snap["shadowCompleted"] == 1
+    assert snap["exactMatchRatePct"] == 0.0
+    assert snap["shadowErrors"] == 0
 
 
-async def test_recordShadowResult_error_skips_exactMatch_flag(store: MetricsStore) -> None:
+async def test_recordShadowResult_error_skips_exactMatch_flag(store: MetricsService) -> None:
     """error=True must win over exactMatch=True."""
     await store.recordShadowResult(error=True, exactMatch=True)
-    assert store.shadowErrors == 1
-    assert store.exactMatches == 0
+    snap = await store.snapshot()
+    assert snap["shadowErrors"] == 1
+    assert snap["exactMatchRatePct"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +69,11 @@ async def test_recordShadowResult_error_skips_exactMatch_flag(store: MetricsStor
 # ---------------------------------------------------------------------------
 
 
-async def test_recordShed_increments(store: MetricsStore) -> None:
+async def test_recordShed_increments(store: MetricsService) -> None:
     await store.recordShed()
     await store.recordShed()
-    assert store.shedCount == 2
+    snap = await store.snapshot()
+    assert snap["shedCount"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +81,8 @@ async def test_recordShed_increments(store: MetricsStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_zero_state(store: MetricsStore) -> None:
-    snap = store.snapshot()
+async def test_snapshot_zero_state(store: MetricsService) -> None:
+    snap = await store.snapshot()
     assert snap["totalRequests"] == 0
     assert snap["shadowErrors"] == 0
     assert snap["shadowCompleted"] == 0
@@ -82,22 +90,22 @@ def test_snapshot_zero_state(store: MetricsStore) -> None:
     assert snap["shedCount"] == 0
 
 
-async def test_snapshot_exactMatchRate_two_thirds(store: MetricsStore) -> None:
+async def test_snapshot_exactMatchRate_two_thirds(store: MetricsService) -> None:
     await store.recordShadowResult(error=False, exactMatch=True)
     await store.recordShadowResult(error=False, exactMatch=True)
     await store.recordShadowResult(error=False, exactMatch=False)
-    snap = store.snapshot()
+    snap = await store.snapshot()
     assert snap["exactMatchRatePct"] == pytest.approx(66.67)
 
 
-async def test_snapshot_exactMatchRate_all_errors(store: MetricsStore) -> None:
+async def test_snapshot_exactMatchRate_all_errors(store: MetricsService) -> None:
     await store.recordShadowResult(error=True)
     await store.recordShadowResult(error=True)
-    snap = store.snapshot()
+    snap = await store.snapshot()
     assert snap["exactMatchRatePct"] == 0.0
 
 
-async def test_snapshot_exactMatchRate_100_percent(store: MetricsStore) -> None:
+async def test_snapshot_exactMatchRate_100_percent(store: MetricsService) -> None:
     await store.recordShadowResult(error=False, exactMatch=True)
-    snap = store.snapshot()
+    snap = await store.snapshot()
     assert snap["exactMatchRatePct"] == 100.0

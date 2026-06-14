@@ -2,170 +2,135 @@ import asyncio
 import json
 import logging
 import random
+import time
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
-import httpx
-
-from app.core.database import recordMismatch
-from app.core.shadowPool import ShadowPool
-from app.db.settings import getSettings
-from app.resources.config.configService import runtimeConfig
-from app.resources.metrics.metricsService import metricsStore
+from app.common.circuitBreaker import CircuitBreaker
+from app.common.taskUtils import safeTask
+from app.core.llmClient import _getContent, _parseAction
+from app.domain.models.enums import TaskType
+from app.ports.blobStorage import BlobStoragePort
+from app.ports.llm import LlmPort
+from app.ports.messageQueue import MessageQueuePort
+from app.resources.config.configService import ConfigService
+from app.resources.metrics.metricsService import MetricsService
 
 logger = logging.getLogger(__name__)
-settings = getSettings()
 
-_PRIMARY_CHAT_URL: str = f"{settings.PRIMARY_LLM_BASE_URL}/chat/completions"
-_CANDIDATE_CHAT_URL: str = f"{settings.CANDIDATE_LLM_BASE_URL}/chat/completions"
-
-# Bounded pool — shadows beyond MAX_CONCURRENT_SHADOWS are dropped, not queued.
-shadowPool = ShadowPool(maxConcurrent=settings.MAX_CONCURRENT_SHADOWS)
+SHADOW_TASKS_TOPIC = "shadow.tasks"
 
 
-def _authHeaders(apiKey: str) -> dict[str, str]:
+class ProxyService:
     """
-    Build ``Authorization`` and ``Content-Type`` headers for an LLM request.
+    Critical-path contract: the ONLY blocking operation is the primary LLM call
+    (wrapped with a timeout and a circuit breaker). Everything else — SQS publish,
+    S3 archive, metrics increment — is a fire-and-forget background task that
+    never touches response latency.
 
-    :param apiKey: Bearer token for the target endpoint.
-    :type apiKey: str
-    :return: Dict containing ``Authorization`` and ``Content-Type`` headers.
-    :rtype: dict[str, str]
+    The primary LLM provider is injected as a LlmPort. Swap providers (OpenAI →
+    Groq → DigitalOcean inference → …) by changing cloud.env — no code changes.
     """
-    return {"Authorization": f"Bearer {apiKey}", "Content-Type": "application/json"}
 
+    def __init__(
+        self,
+        queue: MessageQueuePort,
+        storage: BlobStoragePort,
+        metrics: MetricsService,
+        config: ConfigService,
+        primaryLlm: LlmPort,
+        circuitBreaker: CircuitBreaker,
+    ) -> None:
+        self._queue = queue
+        self._storage = storage
+        self._metrics = metrics
+        self._config = config
+        self._primaryLlm = primaryLlm
+        self._breaker = circuitBreaker
 
-async def _callLlm(
-    client: httpx.AsyncClient,
-    url: str,
-    apiKey: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    POST a chat completion payload to an LLM endpoint and return the parsed response.
+    async def proxyChat(self, requestPayload: dict[str, Any]) -> dict[str, Any]:
+        # Shadow sampling — single Redis GET (~0.5 ms), TTL-cached in process.
+        shadowPct = await self._config.getShadowPercentage()
+        doShadow = random.random() * 100 < shadowPct
 
-    :param client: Shared async HTTP client for the request.
-    :type client: httpx.AsyncClient
-    :param url: Full chat completions URL of the target endpoint.
-    :type url: str
-    :param apiKey: Bearer token for authentication.
-    :type apiKey: str
-    :param payload: OpenAI-compatible request body.
-    :type payload: dict[str, Any]
-    :return: Parsed JSON response from the LLM.
-    :rtype: dict[str, Any]
-    :raises httpx.HTTPStatusError: If the endpoint returns a non-2xx status.
-    :raises httpx.RequestError: If the request fails at the transport layer.
-    """
-    response = await client.post(url, headers=_authHeaders(apiKey), json=payload, timeout=60.0)
-    response.raise_for_status()
-    return response.json()
+        # One taskId ties the shadow event and the S3 archive together.
+        taskId = str(uuid4())
 
+        messages = requestPayload.get("messages", [])
 
-def _getContent(llmResponse: dict[str, Any]) -> str:
-    """
-    Extract the raw content string from the first choice of an LLM response.
+        start = time.monotonic()
+        # Circuit breaker wraps the LLM call; raises CircuitOpenError when OPEN.
+        # wait_for provides a hard outer deadline matching the adapter's timeout.
+        primaryResponse = await asyncio.wait_for(
+            self._breaker.call(self._primaryLlm.chat(messages)),
+            timeout=self._primaryLlm.timeoutSeconds,
+        )
+        latencyMs = int((time.monotonic() - start) * 1000)
 
-    :param llmResponse: Raw LLM response dict (OpenAI-compatible schema).
-    :type llmResponse: dict[str, Any]
-    :return: Content string, or an empty string if the path is missing.
-    :rtype: str
-    """
-    try:
-        return llmResponse["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return ""
+        # ── Return to client here. All tasks below are fire-and-forget. ──────
+        safeTask(self._metrics.incrementRequests(), name="metrics-increment")
 
-
-def _extractAction(llmResponse: dict[str, Any]) -> str | None:
-    """
-    Parse the first choice's content as JSON and extract the ``action`` key.
-
-    :param llmResponse: Raw LLM response dict (OpenAI-compatible schema).
-    :type llmResponse: dict[str, Any]
-    :return: Value of the ``action`` key if the content is valid JSON and the
-        key is present; ``None`` otherwise.
-    :rtype: str or None
-    """
-    try:
-        content: str = llmResponse["choices"][0]["message"]["content"]
-        return json.loads(content).get("action")
-    except (KeyError, IndexError, json.JSONDecodeError, TypeError, AttributeError):
-        return None
-
-
-async def _runShadow(candidatePayload: dict[str, Any], primaryResponse: dict[str, Any]) -> None:
-    """
-    Fire-and-forget coroutine: call the candidate LLM, evaluate against the
-    primary response, stream any mismatch to SQLite, and update
-    :data:`metricsStore`.  Never raises — all exceptions are caught and logged.
-
-    :param candidatePayload: Request body to send to the candidate endpoint.
-    :type candidatePayload: dict[str, Any]
-    :param primaryResponse: Already-returned primary LLM response used for comparison.
-    :type primaryResponse: dict[str, Any]
-    """
-    try:
-        async with httpx.AsyncClient() as client:
-            candidateResponse = await asyncio.wait_for(
-                _callLlm(client, _CANDIDATE_CHAT_URL, settings.candidateKey(), candidatePayload),
-                timeout=settings.SHADOW_TIMEOUT_SECONDS,
+        if doShadow:
+            safeTask(
+                self._publishShadow(taskId, messages, primaryResponse, latencyMs),
+                name=f"shadow-publish-{taskId}",
             )
 
-        primaryAction = _extractAction(primaryResponse)
-        candidateAction = _extractAction(candidateResponse)
-
-        # Heuristic 1: both must yield parseable JSON (non-None implies JSON parsed).
-        # Heuristic 2: the `action` key must match exactly.
-        bothValid = primaryAction is not None and candidateAction is not None
-        exactMatch = bothValid and primaryAction == candidateAction
-
-        if bothValid and not exactMatch:
-            await recordMismatch(
-                primaryAction=primaryAction,
-                candidateAction=candidateAction,
-                primaryContent=_getContent(primaryResponse),
-                candidateContent=_getContent(candidateResponse),
-            )
-
-        logger.debug(
-            "Shadow eval — primaryAction=%r candidateAction=%r exactMatch=%s",
-            primaryAction,
-            candidateAction,
-            exactMatch,
-        )
-        await metricsStore.recordShadowResult(error=False, exactMatch=exactMatch)
-
-    except Exception as exc:
-        logger.warning("Shadow execution failed: %s", exc)
-        await metricsStore.recordShadowResult(error=True)
-
-
-async def proxyChat(requestPayload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Route the request to the primary LLM and immediately return its response.
-
-    Conditionally dispatches the same request to the candidate for shadow
-    evaluation based on :attr:`runtimeConfig.shadowPercentage`, subject to
-    :data:`shadowPool` capacity.
-
-    :param requestPayload: OpenAI-compatible chat request body (``model`` key
-        excluded — injected per-call by this function).
-    :type requestPayload: dict[str, Any]
-    :return: The primary LLM's raw response dict.
-    :rtype: dict[str, Any]
-    """
-    await metricsStore.incrementRequests()
-
-    primaryPayload = {**requestPayload, "model": settings.PRIMARY_LLM_MODEL}
-    async with httpx.AsyncClient() as client:
-        primaryResponse = await _callLlm(
-            client, _PRIMARY_CHAT_URL, settings.primaryKey(), primaryPayload
+        safeTask(
+            self._archive(taskId, messages, primaryResponse, latencyMs),
+            name=f"archive-{taskId}",
         )
 
-    if random.random() * 100 < runtimeConfig.shadowPercentage:
-        candidatePayload = {**requestPayload, "model": settings.CANDIDATE_LLM_MODEL}
-        submitted = await shadowPool.submit(_runShadow(candidatePayload, primaryResponse))
-        if not submitted:
-            await metricsStore.recordShed()
+        return primaryResponse
 
-    return primaryResponse
+    async def _publishShadow(
+        self,
+        taskId: str,
+        messages: list[dict[str, Any]],
+        primaryResponse: dict[str, Any],
+        latencyMs: int,
+    ) -> None:
+        primaryContent = _getContent(primaryResponse)
+        primaryAction = _parseAction(primaryContent)
+
+        payload = {
+            "taskId": taskId,
+            "taskType": TaskType.GENERIC.value,
+            "messages": messages,
+            "primaryResponse": {
+                "model": self._primaryLlm.modelId,
+                "decision": primaryAction.decision,
+                "rawContent": primaryContent,
+                "latencyMs": latencyMs,
+            },
+            "publishedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            await self._queue.publish(SHADOW_TASKS_TOPIC, payload)
+        except Exception:
+            logger.warning("Failed to publish shadow event for task %s", taskId)
+
+    async def _archive(
+        self,
+        taskId: str,
+        messages: list[dict[str, Any]],
+        primaryResponse: dict[str, Any],
+        latencyMs: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        path = f"tasks/GENERIC/{now.strftime('%Y/%m/%d')}/{taskId}.json"
+        data = json.dumps(
+            {
+                "taskId": taskId,
+                "taskType": "GENERIC",
+                "messages": messages,
+                "primaryContent": _getContent(primaryResponse),
+                "latencyMs": latencyMs,
+                "timestamp": now.isoformat(),
+            }
+        ).encode()
+        try:
+            await self._storage.put(path, data)
+        except Exception:
+            logger.warning("Failed to archive task %s to blob storage", taskId)

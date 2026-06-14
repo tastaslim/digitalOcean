@@ -1,6 +1,6 @@
 import pytest
 
-from app.resources.proxy.proxyService import _extractAction, _getContent
+from app.core.llmClient import _extractAction, _getContent
 
 
 # ---------------------------------------------------------------------------

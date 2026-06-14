@@ -1,33 +1,34 @@
 import pytest
 
-from app.resources.config.configService import RuntimeConfig
+from app.adapters.cache.memory import InMemoryCacheAdapter
+from app.resources.config.configService import ConfigService
 
 
 @pytest.fixture
-def cfg() -> RuntimeConfig:
-    return RuntimeConfig()
+def cfg() -> ConfigService:
+    return ConfigService(cache=InMemoryCacheAdapter())
 
 
-def test_default_shadowPercentage(cfg: RuntimeConfig) -> None:
-    assert cfg.shadowPercentage == 100.0
+async def test_default_shadowPercentage(cfg: ConfigService) -> None:
+    assert await cfg.getShadowPercentage() == 100.0
 
 
-async def test_update_changes_percentage(cfg: RuntimeConfig) -> None:
+async def test_update_changes_percentage(cfg: ConfigService) -> None:
     await cfg.update(shadowPercentage=50.0)
-    assert cfg.shadowPercentage == 50.0
+    assert await cfg.getShadowPercentage() == 50.0
 
 
-async def test_update_to_zero(cfg: RuntimeConfig) -> None:
+async def test_update_to_zero(cfg: ConfigService) -> None:
     await cfg.update(shadowPercentage=0.0)
-    assert cfg.shadowPercentage == 0.0
+    assert await cfg.getShadowPercentage() == 0.0
 
 
-async def test_snapshot_reflects_current_value(cfg: RuntimeConfig) -> None:
+async def test_snapshot_reflects_current_value(cfg: ConfigService) -> None:
     await cfg.update(shadowPercentage=75.5)
-    snap = cfg.snapshot()
+    snap = await cfg.snapshot()
     assert snap["shadowPercentage"] == 75.5
 
 
-def test_snapshot_default(cfg: RuntimeConfig) -> None:
-    snap = cfg.snapshot()
+async def test_snapshot_default(cfg: ConfigService) -> None:
+    snap = await cfg.snapshot()
     assert snap["shadowPercentage"] == 100.0

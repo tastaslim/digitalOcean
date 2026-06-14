@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from app.main import app
-from app.resources.metrics.metricsService import metricsStore
+from app.resources.metrics.metricsService import MetricsService
 
 transport = httpx.ASGITransport(app=app)
 
@@ -42,16 +42,19 @@ async def test_metrics_initial_state_is_zeroed(client: httpx.AsyncClient) -> Non
     assert data["shedCount"] == 0
 
 
-async def test_metrics_reflect_manual_increments(client: httpx.AsyncClient) -> None:
-    metricsStore.totalRequests = 7
-    metricsStore.shadowCompleted = 6
-    metricsStore.exactMatches = 4
-    metricsStore.shedCount = 1
+async def test_metrics_reflect_incremented_counters(client: httpx.AsyncClient) -> None:
+    svc = MetricsService(cache=app.state.container.cache)
+    for _ in range(7):
+        await svc.incrementRequests()
+    for _ in range(6):
+        await svc.recordShadowResult(error=False, exactMatch=False)
+    for _ in range(4):
+        await svc.recordShadowResult(error=False, exactMatch=True)
+    await svc.recordShed()
 
     resp = await client.get("/metrics")
     data = resp.json()["data"]
-
     assert data["totalRequests"] == 7
-    assert data["shadowCompleted"] == 6
+    assert data["shadowCompleted"] == 10
     assert data["shedCount"] == 1
-    assert data["exactMatchRatePct"] == pytest.approx(66.67)
+    assert data["exactMatchRatePct"] == pytest.approx(40.0)

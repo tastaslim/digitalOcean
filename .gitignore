@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 cloud.env
 mismatches.db
+.shadow_storage/
 *.pyc
 .pytest_cache/

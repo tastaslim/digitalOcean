@@ -5,8 +5,8 @@ import httpx
 import pytest
 
 from app.main import app
-from app.resources.config.configService import runtimeConfig
-from app.resources.metrics.metricsService import metricsStore
+from app.resources.config.configService import ConfigService
+from app.resources.metrics.metricsService import MetricsService
 from tests.conftest import CHAT_PAYLOAD, PRIMARY_RESPONSE
 
 transport = httpx.ASGITransport(app=app)
@@ -36,7 +36,8 @@ async def test_config_update_returns_applied_value(client: httpx.AsyncClient) ->
 
 async def test_config_update_persists_to_runtime(client: httpx.AsyncClient) -> None:
     await client.put("/config", json={"shadowPercentage": 25.0})
-    assert runtimeConfig.shadowPercentage == 25.0
+    svc = ConfigService(cache=app.state.container.cache)
+    assert await svc.getShadowPercentage() == 25.0
 
 
 async def test_config_rejects_percentage_above_100(client: httpx.AsyncClient) -> None:
@@ -72,21 +73,29 @@ async def test_config_rejects_missing_field(client: httpx.AsyncClient) -> None:
 async def test_zero_percent_suppresses_all_shadows(client: httpx.AsyncClient) -> None:
     await client.put("/config", json={"shadowPercentage": 0.0})
 
-    with patch("app.resources.proxy.proxyService._callLlm", new_callable=AsyncMock) as mock:
+    with patch.object(app.state.container.primaryLlm, "chat", new_callable=AsyncMock) as mock:
         mock.return_value = PRIMARY_RESPONSE
         await client.post("/v1/chat", json=CHAT_PAYLOAD)
         await asyncio.sleep(0.05)
 
-    assert mock.await_count == 1  # primary only
-    assert metricsStore.shadowCompleted == 0
+    assert mock.await_count == 1  # primary only — shadow never published
+    svc = MetricsService(cache=app.state.container.cache)
+    snap = await svc.snapshot()
+    assert snap["shadowCompleted"] == 0
 
 
 async def test_100_percent_always_shadows(client: httpx.AsyncClient) -> None:
     await client.put("/config", json={"shadowPercentage": 100.0})
 
-    with patch("app.resources.proxy.proxyService._callLlm", new_callable=AsyncMock) as mock:
-        mock.return_value = PRIMARY_RESPONSE
+    with (
+        patch.object(app.state.container.primaryLlm, "chat", new_callable=AsyncMock) as primary_mock,
+        patch.object(app.state.shadow_worker.candidateLlm, "chat", new_callable=AsyncMock) as shadow_mock,
+    ):
+        primary_mock.return_value = PRIMARY_RESPONSE
+        shadow_mock.return_value = PRIMARY_RESPONSE
         await client.post("/v1/chat", json=CHAT_PAYLOAD)
         await asyncio.sleep(0.1)
 
-    assert mock.await_count == 2  # primary + candidate
+    svc = MetricsService(cache=app.state.container.cache)
+    snap = await svc.snapshot()
+    assert snap["shadowCompleted"] == 1

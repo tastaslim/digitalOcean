@@ -1,24 +1,80 @@
+import asyncio
 from typing import Any
-from fastapi import APIRouter
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.common.circuitBreaker import CircuitBreaker, CircuitOpenError
+from app.infrastructure.dependencies import (
+    getCircuitBreaker,
+    getConfigService,
+    getMetricsService,
+    getPrimaryLlm,
+    getQueue,
+    getStorage,
+)
+from app.ports.blobStorage import BlobStoragePort
+from app.ports.llm import LlmPort
+from app.ports.messageQueue import MessageQueuePort
+from app.resources.config.configService import ConfigService
+from app.resources.metrics.metricsService import MetricsService
 from app.resources.proxy.proxyDtos import ChatRequest
-from app.resources.proxy.proxyHandler import handleChatRequest
+from app.resources.proxy.proxyService import ProxyService
 
 proxyRoute = APIRouter(prefix="/v1", tags=["proxy"])
 
 
+def _getProxyService(
+    queue: MessageQueuePort = Depends(getQueue),
+    storage: BlobStoragePort = Depends(getStorage),
+    metrics: MetricsService = Depends(getMetricsService),
+    config: ConfigService = Depends(getConfigService),
+    primaryLlm: LlmPort = Depends(getPrimaryLlm),
+    circuitBreaker: CircuitBreaker = Depends(getCircuitBreaker),
+) -> ProxyService:
+    return ProxyService(
+        queue=queue,
+        storage=storage,
+        metrics=metrics,
+        config=config,
+        primaryLlm=primaryLlm,
+        circuitBreaker=circuitBreaker,
+    )
+
+
 @proxyRoute.post("/chat")
-async def chat(request: ChatRequest) -> Any:
+async def chat(
+    request: ChatRequest,
+    proxySvc: ProxyService = Depends(_getProxyService),
+) -> Any:
     """
     Proxy a chat completion request to the primary LLM and return its response.
 
-    The same request is concurrently dispatched to the candidate LLM in the
-    background via the shadow pool; candidate latency never affects this response.
+    The same request is published to the shadow queue for async evaluation
+    against the candidate LLM; candidate latency never affects this response.
 
-    :param request: Validated OpenAI-compatible chat request body.
-    :type request: ChatRequest
-    :return: The primary LLM's raw chat completion response.
-    :rtype: dict[str, Any]
+    Error responses:
+      400 — missing or invalid request body
+      401 — missing or invalid X-API-Key (when auth is enabled)
+      502 — primary LLM unreachable (transport error)
+      503 — circuit breaker open; primary LLM is repeatedly failing
+      504 — primary LLM exceeded PRIMARY_LLM_TIMEOUT_SECONDS
+      5xx — primary LLM returned an error status
     """
-    # model is excluded here; the service injects PRIMARY/CANDIDATE model names per call.
     payload = request.model_dump(exclude_none=True, exclude={"model"})
-    return await handleChatRequest(payload)
+    try:
+        return await proxySvc.proxyChat(payload)
+    except CircuitOpenError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Primary LLM did not respond within the configured timeout.",
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=exc.response.status_code,
+            detail=f"Primary LLM returned error: {exc.response.text}",
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Primary LLM unreachable: {exc}")

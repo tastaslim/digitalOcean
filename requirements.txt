@@ -1,8 +1,29 @@
+# Core — always required
 fastapi[standard]
 uvicorn[standard]
 pydantic-settings
 httpx
 aiosqlite
+
+# Test suite
 pytest>=8.0
 pytest-asyncio==0.23.8
 anyio
+
+# ---------------------------------------------------------------------------
+# Optional backend adapters — install only the ones matching your *_BACKEND
+# settings. The Container lazy-loads each adapter, so missing packages only
+# raise ImportError when that backend is actually selected.
+# ---------------------------------------------------------------------------
+
+# CACHE_BACKEND=redis
+redis[asyncio]
+
+# DB_BACKEND=postgres
+asyncpg
+
+# QUEUE_BACKEND=sqs or STORAGE_BACKEND=s3
+boto3
+
+# STORAGE_BACKEND=azure
+# azure-storage-blob
