@@ -68,6 +68,54 @@ graph TD
 > **Solid arrows** = blocking (user waits). **Dashed arrows** = fire-and-forget (user doesn't wait).
 >
 > **Step ordering that makes this fast:** Step 2 (publish) fires *before* Step 3 (await primary), so the worker's candidate call (Steps 6–8) overlaps with the primary call (Steps 3–5). Steps 9–10 run on **both** sides independently; whichever finishes last wins the atomic claim at Step 11 and runs the comparison exactly once.
+>
+> **Does Step 2 before Step 3 deprioritize the user? No.** Step 2 is `safeTask(queue.publish(...))`, which calls `asyncio.create_task` and returns in microseconds — it does **not** `await` the publish. Because `create_task` doesn't run the coroutine body synchronously, the SNS publish only starts executing at the next `await` (the primary call on the very next line) and then runs *concurrently* with it on the event loop. So the only thing on the user's critical path is the primary LLM call; the publish overlaps it and, if still in flight when primary returns, the user is already gone. Publishing first is what lets the candidate call overlap primary — `await`-ing the publish here (instead of fire-and-forget) is the anti-pattern that *would* make every user pay SNS latency, and the code deliberately avoids it.
+
+---
+
+## Components — what each part does and why
+
+Every component sits behind a **port** (interface), so the same code runs with
+in-memory/SQLite/local adapters for dev and tests, and with the managed-service
+adapters listed below in production. Swap them with one line in `cloud.env`.
+
+### Proxy Service *(publish side — `app/main.py`)*
+- **What it does:** the only public HTTP service. Serves `POST /v1/chat`, calls the primary LLM, returns the response, and fires the shadow event. Also serves `GET /metrics` and `PUT /config`.
+- **Why it's separate from the worker:** the request path must stay fast and predictable. Keeping the candidate LLM call out of this process means a slow/failing candidate can never affect user latency, and the two sides scale independently.
+
+### Primary LLM *(the current production model)*
+- **What it does:** the model your users actually talk to. Its response is the **only** thing on the user's critical path.
+- **Why bounded:** wrapped in a circuit breaker + `asyncio.wait_for` timeout so a misbehaving upstream fails fast (503/504) instead of hanging requests.
+
+### Candidate LLM *(the new model under test)*
+- **What it does:** the model you're evaluating. Called only by the worker, fully off the user path. Swappable (OpenAI → Groq → anything) by changing `CANDIDATE_LLM_*` — no code change, because it's behind the `LlmPort` interface.
+
+### Message Queue — **SNS → SQS** *(`QUEUE_BACKEND`: `sqs` | `memory`)*
+- **What it does:** decouples the proxy from the worker. The proxy publishes a lightweight trigger `{taskId, taskType, messages}` to an **SNS topic**, which fans out to one or more **SQS queues** the workers long-poll.
+- **Why SNS + SQS (not a direct call):** durability + buffering + fan-out. If all workers are down, messages wait in SQS instead of being lost; bursts are absorbed by the queue; adding a new candidate model is just another SNS subscription. SQS gives at-least-once delivery and a retry/visibility-timeout story for free.
+- **Why not put the primary response in the message:** that would force the worker to wait for primary before starting the candidate, killing the parallelism. The message is only a trigger.
+
+### Shadow Worker Service *(consume side — `app/worker.py`)*
+- **What it does:** a separate container (`python -m app.worker`) that long-polls SQS, calls the candidate LLM, archives the result, and participates in the comparison. Scale it horizontally (`--scale worker=N`) when evaluation is the bottleneck.
+- **Safety valve:** a bounded `ShadowPool` load-sheds (drops + counts) when more shadow tasks arrive than `MAX_CONCURRENT_SHADOWS`, so a traffic spike can't exhaust memory.
+
+### Blob Storage — **S3** *(`STORAGE_BACKEND`: `s3` | `local` | `azure`)*
+- **What it stores:** the full raw responses — `primary.json` (written by the proxy) and `candidate.json` (written by the worker), keyed by `tasks/<taskType>/<YYYY/MM/DD>/<taskId>/`.
+- **Why S3:** these blobs are large, write-once, and read rarely (offline replay, debugging, audits). Object storage is the cheapest durable home for that and scales infinitely — you would never want full LLM payloads bloating your relational DB. Each side writes its own object independently, so there's no coordination on the hot path.
+
+### Checkpoint + Mismatch DB — **PostgreSQL** *(`DB_BACKEND`: `postgres` | `sqlite`)*
+
+One relational database, used for two related jobs:
+
+- **`shadow_tasks` (checkpoint + coordination):** one row per task tracking `is_primary_done`, `is_candidate_done`, `is_comparison_triggered`, plus S3 paths and parsed actions. This is the **synchronization point** between the two services. The atomic `UPDATE … WHERE is_comparison_triggered = 0` is what guarantees the comparison runs **exactly once** even though both sides race to it — that needs a real transactional store, which is why this is PostgreSQL and not Redis. It also enables crash recovery: a stalled row (`findStalled`) can be re-queued.
+- **`mismatches` (queryable system of record):** permanent, structured records of every disagreement, with severity and diff fields. We need rich queries here ("all `ORDER_CANCELLATION` mismatches with `CRITICAL` severity last week"), which is exactly what SQL indexes give you. (The same DB also holds `model_fleet` config.)
+
+### Cache — **Redis** *(`CACHE_BACKEND`: `redis` | `memory`)*
+- **What it stores:** the high-frequency, low-durability state — live **metrics counters** (`totalRequests`, `shadowCompleted`, `exactMatches`, `shedCount`, …) and the **runtime config** (the shadow sampling percentage).
+- **Why Redis and not Postgres:** these are touched on basically every request (atomic `INCR` on counters, a `GET` on the sampling percentage). Redis makes those sub-millisecond and **shared across all proxy replicas**, so metrics aggregate correctly and a `PUT /config` change is seen by every instance instantly with no restart. Putting per-request `INCR`s in Postgres would add DB round-trips to the hot path and create write contention. Losing a counter on a Redis blip is acceptable; losing a mismatch record is not — which is the dividing line between what lives in Redis vs Postgres.
+
+### Domain Evaluator (`runComparison`)
+- **What it does:** not a service, but the comparison logic the claim-winner runs in-process. Picks the evaluator for the task type (`GENERIC` / `JOB_CANCELLATION` / `ORDER_CANCELLATION`) and decides match vs mismatch + severity. Shared code so the proxy *or* the worker can run it depending on who wins the claim.
 
 ---
 
