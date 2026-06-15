@@ -12,11 +12,11 @@ This service is the infrastructure that makes that happen at scale (millions of 
 
 ## High-Level Design (HLD)
 
-This is **Variant B**: the proxy publishes the shadow event to the queue
-**before** it awaits the primary LLM, so the candidate call runs *in parallel*
-with primary instead of after it. Both sides write their result into a shared
-`shadow_tasks` checkpoint row and then race to run the comparison — an atomic
-claim guarantees it happens exactly once, on whichever side finishes last.
+The proxy publishes the shadow event to the queue **before** it awaits the
+primary LLM, so the candidate call runs *in parallel* with primary instead of
+after it. Both sides write their result into a shared `shadow_tasks` checkpoint
+row and then race to run the comparison — an atomic claim guarantees it happens
+exactly once, on whichever side finishes last.
 
 ```mermaid
 graph TD
@@ -49,7 +49,8 @@ graph TD
 
     Checkpoint -->|"Step 11: winner of atomic claim runs comparison"| Compare
     Compare -->|"Step 12: save mismatch (only if differ)"| DB
-    Compare -->|"Step 13: record metrics + markComparisonDone"| Cache
+    Compare -->|"Step 13: markComparisonDone"| Checkpoint
+    Compare -->|"Step 14: recordShadowResult (metrics)"| Cache
 
     style Client fill:#4a90d9,color:#fff
     style PrimaryLLM fill:#7b68ee,color:#fff
@@ -66,16 +67,16 @@ graph TD
 
 > **Solid arrows** = blocking (user waits). **Dashed arrows** = fire-and-forget (user doesn't wait).
 >
-> **Step ordering that makes Variant B fast:** Step 2 (publish) fires *before* Step 3 (await primary), so the worker's candidate call (Steps 6–8) overlaps with the primary call (Steps 3–5). Steps 9–10 run on **both** sides independently; whichever finishes last wins the atomic claim at Step 11 and runs the comparison exactly once.
+> **Step ordering that makes this fast:** Step 2 (publish) fires *before* Step 3 (await primary), so the worker's candidate call (Steps 6–8) overlaps with the primary call (Steps 3–5). Steps 9–10 run on **both** sides independently; whichever finishes last wins the atomic claim at Step 11 and runs the comparison exactly once.
 
 ---
 
 ## Request Sequence Diagram
 
-In Variant B the candidate call (worker) runs **concurrently** with the
-primary call (proxy). Both sides write to the `shadow_tasks` checkpoint and
-call `tryClaimComparison()`; the side that finishes last gets `claimed=true`
-and runs the comparison once.
+The candidate call (worker) runs **concurrently** with the primary call
+(proxy). Both sides write to the `shadow_tasks` checkpoint and call
+`tryClaimComparison()`; the side that finishes last gets `claimed=true` and
+runs the comparison once.
 
 ```mermaid
 sequenceDiagram
@@ -124,14 +125,12 @@ sequenceDiagram
     Chk-->>Proxy: claimed=true (if proxy finished last)
     Chk-->>Worker: claimed=true (if worker finished last)
 
-    Note over Proxy,Worker: the winner runs runComparison(task)
-    alt responses match
-        Proxy->>Cache: recordShadowResult(exactMatch=true)
-    else responses differ
+    Note over Proxy,Worker: the winner runs runComparison(task) — order below matches the code
+    opt responses differ
         Proxy->>DB: save MismatchRecord
-        Proxy->>Cache: recordShadowResult(exactMatch=false)
     end
-    Proxy->>Chk: markComparisonDone(taskId)
+    Proxy->>Chk: markComparisonDone(taskId, match|mismatch)
+    Proxy->>Cache: recordShadowResult(exactMatch=true|false)
 ```
 
 ---
@@ -145,8 +144,9 @@ flowchart TD
     SC -->|"not sampled"| B0["Call PRIMARY LLM"]
     PUB --> B["Step 2: call PRIMARY LLM"]
 
-    B --> C["Step 3: return response to client"]
-    B0 --> C0(["Return response (no shadow)"])
+    B --> C["Step 3: return response to client<br/>(+ incrementRequests)"]
+    B0 --> C0["Return response + incrementRequests<br/>+ archive primary.json (no compare)"]
+    C0 --> Z2(["Done (no shadow)"])
 
     C --> AP["Step 4a: archive primary.json<br/>upsertPrimaryDone"]
     AP --> CLP["Step 5a: tryClaimComparison"]
@@ -172,7 +172,7 @@ flowchart TD
     Q --> S
 
     style C fill:#2d8a4e,color:#fff
-    style C0 fill:#2d8a4e,color:#fff
+    style Z2 fill:#2d8a4e,color:#fff
     style K fill:#c0392b,color:#fff
     style N fill:#c0392b,color:#fff
     style R fill:#e67e22,color:#fff
@@ -215,10 +215,10 @@ The proxy does **one** blocking thing: call the primary model and return the ans
 
 This is non-negotiable at scale. If SQS has a 100ms hiccup and we waited for it before responding, every user at that moment would feel that 100ms. With background tasks, users feel nothing.
 
-In Variant B there's one subtlety: the publish is fired **before** awaiting the
-primary call. Publishing is itself fire-and-forget (`safeTask`), so it doesn't
-block — but firing it first means the worker can start the candidate LLM call
-while the primary call is still in flight, cutting end-to-end shadow latency.
+There's one subtlety: the publish is fired **before** awaiting the primary
+call. Publishing is itself fire-and-forget (`safeTask`), so it doesn't block —
+but firing it first means the worker can start the candidate LLM call while the
+primary call is still in flight, cutting end-to-end shadow latency.
 
 ```python
 # What the code actually does (app/resources/proxy/proxyService.py):
@@ -268,9 +268,9 @@ Publishes a TRIGGER (no response):    Picks up that message:
         → whoever finishes last wins the claim and runs the comparison
 ```
 
-Why not put `primaryResponse` in the queue message (Variant A)? Because that
-would force the worker to wait for primary to finish before the candidate call
-could start. Publishing only the trigger lets the two LLM calls overlap.
+Why not put `primaryResponse` in the queue message? Because that would force
+the worker to wait for primary to finish before the candidate call could start.
+Publishing only the trigger lets the two LLM calls overlap.
 
 This means:
 - The proxy doesn't know or care what the worker does

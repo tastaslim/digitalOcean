@@ -26,7 +26,7 @@ class ShadowWorker:
     Background service that consumes shadow events from the queue, calls the
     candidate LLM, and coordinates comparison with the proxy side.
 
-    Variant B pipeline:
+    Pipeline:
       Queue message contains only {taskId, taskType, messages} — no primary
       response. The candidate call starts as soon as the message is dequeued,
       which can overlap with the primary LLM call still running in the proxy.

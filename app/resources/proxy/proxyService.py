@@ -35,7 +35,7 @@ class ProxyService:
     Critical-path contract: the ONLY blocking operation is the primary LLM call
     (wrapped with a timeout and a circuit breaker). Everything else is background.
 
-    Variant B shadow pipeline (true parallelism):
+    Shadow pipeline (true parallelism):
       1. Fire shadow queue message BEFORE awaiting the primary LLM response so
          the worker can start the candidate call while primary is still running.
       2. After primary responds, a background task writes the result to S3 and
