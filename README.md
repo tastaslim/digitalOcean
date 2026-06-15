@@ -20,36 +20,36 @@ claim guarantees it happens exactly once, on whichever side finishes last.
 
 ```mermaid
 graph TD
-    Client(["👤 Client"])
-    Proxy["Proxy Service\n(publish side)\nPOST /v1/chat\nGET /metrics\nPUT /config"]
-    PrimaryLLM(["🧠 Primary LLM\n(GPT-4 / current model)"])
-    Queue[["📬 SNS topic → SQS\n(in-memory in dev)"]]
-    Worker["Shadow Worker Service\n(consume side)"]
-    CandidateLLM(["🧠 Candidate LLM\n(new model under test)"])
-    Checkpoint[("🗄️ shadow_tasks\ncheckpoint + atomic claim\n(PostgreSQL / SQLite)")]
-    Compare["runComparison()\nDomain Evaluator\nGENERIC / JOB_CANCEL / ORDER_CANCEL"]
-    DB[("🗄️ Mismatch DB\n(PostgreSQL / SQLite)")]
-    Cache[("⚡ Cache\n(Redis / in-memory)\nMetrics + Config")]
-    Storage[("🪣 Blob Storage\n(S3 / local)\nprimary.json + candidate.json")]
+    Client(["fa:fa-user Client"])
+    Proxy["Proxy Service (publish side)<br/>POST /v1/chat · GET /metrics · PUT /config"]
+    PrimaryLLM(["Primary LLM<br/>(GPT-4 / current model)"])
+    Queue[["SNS topic to SQS queue<br/>(in-memory in dev)"]]
+    Worker["Shadow Worker Service<br/>(consume side · separate container)"]
+    CandidateLLM(["Candidate LLM<br/>(new model under test)"])
+    Checkpoint[("shadow_tasks<br/>checkpoint + atomic claim<br/>PostgreSQL / SQLite")]
+    Compare["runComparison()<br/>Domain Evaluator<br/>GENERIC / JOB_CANCEL / ORDER_CANCEL"]
+    DB[("Mismatch DB<br/>PostgreSQL / SQLite")]
+    Cache[("Cache (Redis / in-memory)<br/>Metrics + Config")]
+    Storage[("Blob Storage (S3 / local)<br/>primary.json + candidate.json")]
 
-    Client -->|"POST /v1/chat"| Proxy
-    Proxy -.->|"1 — publish FIRST\n{taskId, taskType, messages}"| Queue
-    Proxy -->|"2 — await (blocking)"| PrimaryLLM
-    PrimaryLLM -->|"response"| Proxy
-    Proxy -->|"3 — return immediately"| Client
+    Client -->|"Step 1: POST /v1/chat {messages}"| Proxy
+    Proxy -.->|"Step 2: publish trigger FIRST<br/>{taskId, taskType, messages}"| Queue
+    Proxy -->|"Step 3: await primary chat() (blocking)"| PrimaryLLM
+    PrimaryLLM -->|"Step 4: primary response"| Proxy
+    Proxy -->|"Step 5: return response to user"| Client
 
-    Queue -->|"dequeue (parallel with primary)"| Worker
-    Worker -->|"call candidate LLM"| CandidateLLM
-    CandidateLLM -->|"response"| Worker
+    Queue -->|"Step 6: dequeue (runs parallel to steps 3-5)"| Worker
+    Worker -->|"Step 7: call candidate chat()"| CandidateLLM
+    CandidateLLM -->|"Step 8: candidate response"| Worker
 
-    Proxy -.->|"4a — archive primary"| Storage
-    Worker -.->|"4b — archive candidate"| Storage
-    Proxy -.->|"5a — upsertPrimaryDone\n+ tryClaimComparison"| Checkpoint
-    Worker -.->|"5b — upsertCandidateDone\n+ tryClaimComparison"| Checkpoint
+    Proxy -.->|"Step 9a: put primary.json"| Storage
+    Worker -.->|"Step 9b: put candidate.json"| Storage
+    Proxy -.->|"Step 10a: upsertPrimaryDone + tryClaimComparison"| Checkpoint
+    Worker -.->|"Step 10b: upsertCandidateDone + tryClaimComparison"| Checkpoint
 
-    Checkpoint -->|"winner of atomic claim"| Compare
-    Compare -->|"mismatch"| DB
-    Compare -->|"metrics"| Cache
+    Checkpoint -->|"Step 11: winner of atomic claim runs comparison"| Compare
+    Compare -->|"Step 12: save mismatch (only if differ)"| DB
+    Compare -->|"Step 13: record metrics + markComparisonDone"| Cache
 
     style Client fill:#4a90d9,color:#fff
     style PrimaryLLM fill:#7b68ee,color:#fff
@@ -64,8 +64,9 @@ graph TD
     style Storage fill:#d9534f,color:#fff
 ```
 
-> Solid arrows = **blocking** (user waits). Dashed arrows = **fire-and-forget** (user doesn't wait).
-> Note step **1** (publish) happens *before* step **2** (await primary), so primary and candidate run concurrently.
+> **Solid arrows** = blocking (user waits). **Dashed arrows** = fire-and-forget (user doesn't wait).
+>
+> **Step ordering that makes Variant B fast:** Step 2 (publish) fires *before* Step 3 (await primary), so the worker's candidate call (Steps 6–8) overlaps with the primary call (Steps 3–5). Steps 9–10 run on **both** sides independently; whichever finishes last wins the atomic claim at Step 11 and runs the comparison exactly once.
 
 ---
 
@@ -82,10 +83,10 @@ sequenceDiagram
     actor Client
     participant Proxy as Proxy Service
     participant PrimaryLLM as Primary LLM
-    participant Queue as SNS→SQS
+    participant Queue as SNS to SQS
     participant Worker as Shadow Worker
     participant CandidateLLM as Candidate LLM
-    participant Chk as shadow_tasks (DB)
+    participant Chk as shadow_tasks DB
     participant Storage as Blob Storage
     participant DB as Mismatch DB
     participant Cache as Redis Cache
@@ -139,35 +140,35 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([Request arrives]) --> SC{Shadow\nsampling\ncheck}
-    SC -->|sampled| PUB[Publish to queue\n{taskId, taskType, messages}\nfire-and-forget]
-    SC -->|not sampled| B0[Call PRIMARY LLM]
-    PUB --> B[Call PRIMARY LLM]
+    A(["Request arrives"]) --> SC{"Shadow<br/>sampling check"}
+    SC -->|"sampled"| PUB["Step 1: publish trigger<br/>{taskId, taskType, messages}<br/>fire-and-forget"]
+    SC -->|"not sampled"| B0["Call PRIMARY LLM"]
+    PUB --> B["Step 2: call PRIMARY LLM"]
 
-    B --> C[Return response to client]
-    B0 --> C0([Return response — no shadow])
+    B --> C["Step 3: return response to client"]
+    B0 --> C0(["Return response (no shadow)"])
 
-    C --> AP[Archive primary.json\nupsertPrimaryDone]
-    AP --> CLP[tryClaimComparison]
+    C --> AP["Step 4a: archive primary.json<br/>upsertPrimaryDone"]
+    AP --> CLP["Step 5a: tryClaimComparison"]
 
-    PUB -.parallel.-> I[Worker dequeues message]
-    I --> J{ShadowPool\ncapacity?}
-    J -->|pool full| K[Drop + increment shedCount]
-    J -->|capacity available| L[Call CANDIDATE LLM]
-    L --> M{Candidate\nreturned OK?}
-    M -->|timeout or error| N[increment shadowErrors]
-    M -->|success| AC[Archive candidate.json\nupsertCandidateDone]
-    AC --> CLC[tryClaimComparison]
+    PUB -. "runs in parallel" .-> I["Step 2': worker dequeues message"]
+    I --> J{"ShadowPool<br/>capacity?"}
+    J -->|"pool full"| K["Drop + increment shedCount"]
+    J -->|"capacity available"| L["Step 3': call CANDIDATE LLM"]
+    L --> M{"Candidate<br/>returned OK?"}
+    M -->|"timeout or error"| N["increment shadowErrors"]
+    M -->|"success"| AC["Step 4b: archive candidate.json<br/>upsertCandidateDone"]
+    AC --> CLC["Step 5b: tryClaimComparison"]
 
-    CLP --> WON{Won the\natomic claim?}
+    CLP --> WON{"Won the<br/>atomic claim?"}
     CLC --> WON
-    WON -->|no — other side will run it| Z([Done])
-    WON -->|yes — both sides done| O[runComparison\ndomain evaluator]
+    WON -->|"no (other side will run it)"| Z(["Done"])
+    WON -->|"yes (both sides done)"| O["Step 6: runComparison<br/>domain evaluator"]
 
-    O --> P{Responses\nmatch?}
-    P -->|exact match| Q[increment exactMatches]
-    P -->|mismatch| R[Save MismatchRecord to DB]
-    R --> S[markComparisonDone\nincrement shadowCompleted]
+    O --> P{"Responses<br/>match?"}
+    P -->|"exact match"| Q["increment exactMatches"]
+    P -->|"mismatch"| R["Save MismatchRecord to DB"]
+    R --> S["markComparisonDone<br/>increment shadowCompleted"]
     Q --> S
 
     style C fill:#2d8a4e,color:#fff
