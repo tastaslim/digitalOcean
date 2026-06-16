@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from app.common.circuitBreaker import CircuitBreaker
 from app.common.taskUtils import safeTask
+from app.common.telemetry import injectContext
 from app.core.llmClient import _getContent, _parseAction
 from app.domain.comparison import runComparison
 from app.domain.models.enums import TaskType
@@ -84,10 +85,14 @@ class ProxyService:
         # Publish to queue BEFORE awaiting the primary call so the worker can
         # start the candidate LLM call while we are still waiting for primary.
         if doShadow:
+            # Inject the active trace context into the message attributes so the
+            # worker's spans link into this request's trace across the SNS->SQS hop.
+            traceCarrier = injectContext({})
             safeTask(
                 self._queue.publish(
                     SHADOW_TASKS_TOPIC,
                     {"taskId": taskId, "taskType": TaskType.GENERIC.value, "messages": messages},
+                    attributes=traceCarrier,
                 ),
                 name=f"shadow-publish-{taskId}",
                 timeoutSeconds=_PUBLISH_TIMEOUT_S,

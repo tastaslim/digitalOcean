@@ -9,6 +9,7 @@ from app.common.exceptionHandlers import registerExceptionHandlers
 from app.common.logging.jsonFormatter import JsonFormatter
 from app.common.middleware.authMiddleware import ApiKeyMiddleware
 from app.common.middleware.requestIdMiddleware import RequestIdMiddleware
+from app.common.telemetry import instrumentFastApi, setupTelemetry
 from app.db.settings import getSettings
 from app.infrastructure.container import Container
 from app.resources.metrics.metricsService import MetricsService
@@ -92,7 +93,11 @@ def createApp() -> FastAPI:
     _setupLogging()
     settings = getSettings()
 
+    if settings.TELEMETRY_ENABLED:
+        setupTelemetry("shadow-proxy", endpoint=settings.OTEL_EXPORTER_OTLP_ENDPOINT)
+
     app = FastAPI(title="LLM Shadow Proxy", lifespan=lifespan)
+    instrumentFastApi(app)
 
     # Middleware executes in reverse registration order (last added = outermost).
     # We want: RequestId (outermost, runs first) → ApiKey → route handler

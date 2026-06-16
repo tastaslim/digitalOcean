@@ -17,6 +17,7 @@ import logging
 import signal
 
 from app.common.logging.jsonFormatter import JsonFormatter
+from app.common.telemetry import setupTelemetry
 from app.core.shadowWorker import ShadowWorker
 from app.db.settings import getSettings
 from app.infrastructure.container import Container
@@ -34,6 +35,9 @@ def _setupLogging() -> None:
 async def main() -> None:
     _setupLogging()
     settings = getSettings()
+
+    if settings.TELEMETRY_ENABLED:
+        setupTelemetry("shadow-worker", endpoint=settings.OTEL_EXPORTER_OTLP_ENDPOINT)
 
     if settings.QUEUE_BACKEND == "sqs" and not settings.SQS_QUEUE_URL:
         raise RuntimeError(

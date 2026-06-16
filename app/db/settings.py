@@ -154,6 +154,18 @@ class Settings(BaseSettings):
     AZURE_CONTAINER_NAME: str = ""
 
     # ------------------------------------------------------------------
+    # Observability — OpenTelemetry tracing
+    # ------------------------------------------------------------------
+
+    # Master switch. When false, all telemetry helpers are no-ops and no
+    # OpenTelemetry packages are imported (so dev/tests pay nothing).
+    TELEMETRY_ENABLED: bool = False
+
+    # OTLP/HTTP collector base URL (the SDK appends /v1/traces). Point this at an
+    # OpenTelemetry Collector or a Jaeger all-in-one OTLP endpoint.
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4318"
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 

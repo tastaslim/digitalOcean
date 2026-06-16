@@ -27,3 +27,18 @@ boto3
 
 # STORAGE_BACKEND=azure
 # azure-storage-blob
+
+# ---------------------------------------------------------------------------
+# Observability — OpenTelemetry distributed tracing (TELEMETRY_ENABLED=true).
+# Auto-instruments FastAPI, httpx (LLM calls), boto (SNS/SQS/S3), asyncpg, redis,
+# and propagates trace context across the SNS->SQS hop so one trace spans the
+# proxy and the worker. All imports are lazy, so these are only loaded when
+# tracing is turned on.
+# ---------------------------------------------------------------------------
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-httpx
+opentelemetry-instrumentation-botocore
+opentelemetry-instrumentation-asyncpg
+opentelemetry-instrumentation-redis

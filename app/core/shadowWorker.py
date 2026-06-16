@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from uuid import UUID
 
+from app.common.telemetry import linkedSpan
 from app.core.llmClient import _getContent, _parseAction
 from app.core.shadowPool import ShadowPool
 from app.domain.comparison import runComparison
@@ -85,21 +86,59 @@ class ShadowWorker:
         )
 
     async def _handle(self, message: Message) -> None:
-        taskId = message.body.get("taskId", "unknown")
+        body = message.body
+        # Validate the envelope up front. A malformed message can never succeed,
+        # so raise instead of swallowing it: the SQSAdapter then skips the delete
+        # and SQS redelivers the message, routing it to the dead-letter queue
+        # after the queue's maxReceiveCount. Without this, a poison message would
+        # be dropped silently (or retried forever), defeating the DLQ.
+        self._validateMessage(body)
+        taskId = body["taskId"]
         submitted = await self.pool.submit(
-            self._evaluate(message.body), name=f"shadow-eval-{taskId}"
+            self._evaluate(body, message.attributes), name=f"shadow-eval-{taskId}"
         )
         if not submitted:
             await self._metrics.recordShed()
 
-    async def _evaluate(self, body: dict) -> None:
+    @staticmethod
+    def _validateMessage(body: dict) -> None:
+        """Raise ValueError if the message envelope is structurally invalid.
+
+        Raising (rather than swallowing) is what lets the queue's redrive policy
+        move a poison message to the DLQ instead of dropping it.
+        """
+        taskId = body.get("taskId")
+        if not taskId:
+            raise ValueError(f"shadow message missing taskId: {body!r}")
+        if not body.get("messages"):
+            raise ValueError(f"shadow message {taskId} missing 'messages'")
+        rawType = body.get("taskType")
         try:
-            await self._runEvaluation(body)
-        except Exception:
-            logger.exception(
-                "ShadowWorker: unhandled error for task %s", body.get("taskId")
-            )
-            await self._metrics.recordShadowResult(error=True)
+            TaskType(rawType)
+        except ValueError as exc:
+            raise ValueError(
+                f"shadow message {taskId} has unknown taskType: {rawType!r}"
+            ) from exc
+
+    async def _evaluate(self, body: dict, carrier: dict | None = None) -> None:
+        # linkedSpan ties this evaluation (and the candidate/S3/DB spans nested
+        # under it) into the originating /v1/chat trace via the propagated
+        # context. It is a no-op when telemetry is disabled.
+        with linkedSpan(
+            "shadow.evaluate",
+            carrier,
+            attributes={
+                "shadow.task_id": str(body.get("taskId")),
+                "shadow.task_type": str(body.get("taskType")),
+            },
+        ):
+            try:
+                await self._runEvaluation(body)
+            except Exception:
+                logger.exception(
+                    "ShadowWorker: unhandled error for task %s", body.get("taskId")
+                )
+                await self._metrics.recordShadowResult(error=True)
 
     async def _runEvaluation(self, body: dict) -> None:
         taskType = TaskType(body["taskType"])

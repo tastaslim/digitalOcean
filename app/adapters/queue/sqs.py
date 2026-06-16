@@ -109,9 +109,17 @@ class SQSAdapter(MessageQueuePort):
                 # SNS wraps the original payload in a JSON envelope.
                 outer = json.loads(raw["Body"])
                 body = json.loads(outer.get("Message", raw["Body"]))
+                # Flatten SNS MessageAttributes ({"k": {"Type","Value"}}) to a
+                # plain {k: v} carrier so trace context (traceparent) survives the
+                # SNS->SQS hop and the worker can continue the originating trace.
+                attributes = {
+                    key: meta.get("Value", "")
+                    for key, meta in outer.get("MessageAttributes", {}).items()
+                }
                 msg = Message(
                     id=raw["MessageId"],
                     body=body,
+                    attributes=attributes,
                     receiptHandle=raw["ReceiptHandle"],
                 )
                 await handler(msg)
